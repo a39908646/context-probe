@@ -613,7 +613,7 @@ ul.applied li{margin:2px 0}
 .current{color:var(--muted);font-size:12px}
 .current b{color:var(--accent)}
 a.mini{font-size:12px;font-weight:400;margin-left:6px}
-.toast{position:fixed;top:16px;right:16px;max-width:440px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px;box-shadow:0 6px 24px rgba(0,0,0,.25);z-index:9999;display:none}
+.toast{position:fixed;top:64px;right:16px;max-width:440px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px;box-shadow:0 6px 24px rgba(0,0,0,.25);z-index:9999;display:none}
 .toast.show{display:block}
 .toast h3{margin:0 0 8px;font-size:14px;padding-right:24px}
 .toast ul{max-height:320px;overflow:auto;padding-left:18px;margin:0;font-size:12px;color:var(--muted)}
