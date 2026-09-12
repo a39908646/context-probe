@@ -1,0 +1,9 @@
+# 构建产物 — 不要提交
+dist/
+*.dll
+*.exe
+*.so
+
+# 测试 / 临时文件
+*.bak.plugin.*
+model-context-probe.json
