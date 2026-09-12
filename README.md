@@ -1,5 +1,7 @@
 # context-probe
 
+> 当前版本：**0.2.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
+
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
 渠道的真实上下文 / 输出上限，并把精确的 `max-context-length` 写回 `config.yaml`
 （宿主 file watcher 自动热加载）。

@@ -299,9 +299,9 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.1.0",
+			"Version":          "0.2.0",
 			"Author":           "cloudwayne",
-			"GitHubRepository": "https://github.com/cloudwayne/context-probe",
+			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
 				{"Name": "config_path", "Type": "string", "Description": "config.yaml 路径（默认自动探测 cpa-core/config.yaml）"},
 				{"Name": "mapping_path", "Type": "string", "Description": "映射表路径（未校验渠道回落值）"},
