@@ -393,16 +393,41 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 				scope += " 模型「" + model + "」"
 			}
 		}
-		if startProbe(provider, model) {
+		started := startProbe(provider, model)
+		if req.Query != nil {
+			if v, ok := req.Query["format"]; ok && len(v) > 0 && v[0] == "json" {
+				if started {
+					return mgmtResponse(200, "application/json", mustJSONIndent(map[string]any{"ok": true, "started": true, "scope": scope})), nil
+				}
+				return mgmtResponse(200, "application/json", mustJSONIndent(map[string]any{"ok": true, "started": false, "scope": "已在运行中"})), nil
+			}
+		}
+		if started {
 			return mgmtResponse(200, "text/html; charset=utf-8", renderPage("已开始探测",
-				`<div class="wrap"><h1>已开始探测（`+html.EscapeString(scope)+`）</h1><p>探测在后台运行，页面自动跳转查看进度。</p><p><a class="btn btn-primary" href="?op=status">查看状态</a></p></div>`, 0)), nil
+				`<div class="wrap"><h1>已开始探测（`+html.EscapeString(scope)+`）</h1><p>探测在后台运行。</p><p><a class="btn btn-primary" href="?op=status">查看状态</a></p></div>`, 0)), nil
 		}
 		return mgmtResponse(200, "text/html; charset=utf-8", renderPage("探测已在运行",
 			`<div class="wrap"><h1>探测已在运行中</h1><p><a class="btn btn-primary" href="?op=status">查看状态</a></p></div>`, 0)), nil
 	case "apply":
+		isJSON := false
+		if req.Query != nil {
+			if v, ok := req.Query["format"]; ok && len(v) > 0 && v[0] == "json" {
+				isJSON = true
+			}
+		}
 		probeMu.Lock()
 		rep := last
 		probeMu.Unlock()
+		if isJSON {
+			if rep == nil {
+				return mgmtResponse(200, "application/json", mustJSONIndent(map[string]any{"ok": false, "error": "尚无探测报告，请先运行探测"})), nil
+			}
+			changes, aerr := applyReport(rep)
+			if aerr != nil {
+				return mgmtResponse(200, "application/json", mustJSONIndent(map[string]any{"ok": false, "error": aerr.Error()})), nil
+			}
+			return mgmtResponse(200, "application/json", mustJSONIndent(map[string]any{"ok": true, "changes": changes})), nil
+		}
 		if rep == nil {
 			return mgmtResponse(200, "text/html; charset=utf-8", renderPage("无报告",
 				"<h1>尚无探测报告</h1><p>请先 <a href=\"?op=probe\">运行探测</a>。</p>", 0)), nil
@@ -466,7 +491,48 @@ window.cpApply=function(){
     tr.style.display=(f===''||f===s)?'':'none';
   });
 };
+window.cpToast=function(title,lines){
+  var t=document.getElementById('cp-toast');
+  if(!t)return;
+  document.getElementById('cp-toast-title').textContent=title||'';
+  var u=document.getElementById('cp-toast-list');
+  u.innerHTML='';
+  (lines||[]).forEach(function(l){var li=document.createElement('li');li.textContent=l;u.appendChild(li);});
+  document.getElementById('cp-toast-empty').style.display=(lines&&lines.length)?'none':'block';
+  t.classList.add('show');
+};
+function refreshOnce(){
+  fetch('?op=status',{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
+    var doc=new DOMParser().parseFromString(html,'text/html');
+    var toast=document.getElementById('cp-toast');
+    document.body.replaceChildren.apply(document.body,[toast,...doc.body.childNodes]);
+    if(window.cpApply)window.cpApply();
+  }).catch(function(){});
+}
 document.addEventListener('click',function(e){
+  var ab=e.target.closest('#btn-apply');
+  if(ab){
+    e.preventDefault();
+    ab.textContent='⬇ 写回中…';
+    fetch('?op=apply&format=json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+      ab.textContent='⬇ 应用写回';
+      if(d.ok){window.cpToast('写回完成',d.changes||[]);refreshOnce();}
+      else{window.cpToast('写回失败',[d.error||'未知错误']);}
+    }).catch(function(err){ab.textContent='⬇ 应用写回';window.cpToast('写回失败',[String(err)]);});
+    return;
+  }
+  var pb=e.target.closest('#btn-probe');
+  if(pb){
+    e.preventDefault();
+    fetch('?op=probe&format=json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+      if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
+      window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
+      setTimeout(refreshOnce,800);
+    }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
+    return;
+  }
+  var x=e.target.closest('#cp-toast-close');
+  if(x){document.getElementById('cp-toast').classList.remove('show');return;}
   var c=e.target.closest('.chip[data-filter]');
   if(!c)return;
   e.preventDefault();
@@ -547,7 +613,15 @@ ul.applied li{margin:2px 0}
 .current{color:var(--muted);font-size:12px}
 .current b{color:var(--accent)}
 a.mini{font-size:12px;font-weight:400;margin-left:6px}
-</style>` + bodyHTML + "</body></html>"
+.toast{position:fixed;top:16px;right:16px;max-width:440px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px;box-shadow:0 6px 24px rgba(0,0,0,.25);z-index:9999;display:none}
+.toast.show{display:block}
+.toast h3{margin:0 0 8px;font-size:14px;padding-right:24px}
+.toast ul{max-height:320px;overflow:auto;padding-left:18px;margin:0;font-size:12px;color:var(--muted)}
+.toast .empty{margin:0;font-size:12px;color:var(--muted)}
+.toast-x{position:absolute;top:8px;right:10px;border:none;background:none;color:var(--muted);font-size:14px;cursor:pointer;line-height:1}
+.toast-x:hover{color:var(--text)}
+</style>
+<div id="cp-toast" class="toast"><button id="cp-toast-close" class="toast-x" title="关闭">✕</button><h3 id="cp-toast-title"></h3><ul id="cp-toast-list"></ul><p id="cp-toast-empty" class="empty">没有需要写回的变更</p></div>` + bodyHTML + "</body></html>"
 	return []byte(s)
 }
 
@@ -561,8 +635,8 @@ func statusHTML() []byte {
 	b.WriteString(`<div class="wrap">`)
 	b.WriteString("<h1>Context Probe · 渠道探测</h1>")
 	b.WriteString(`<div class="toolbar">` +
-		`<a class="btn btn-primary" href="?op=probe">▶ 开始探测</a>` +
-		`<a class="btn" href="?op=apply">⬇ 应用写回</a>` +
+		`<a class="btn btn-primary" id="btn-probe" href="?op=probe">▶ 开始探测</a>` +
+		`<a class="btn" id="btn-apply" href="?op=apply">⬇ 应用写回</a>` +
 		`<a class="btn" href="?op=report" target="_blank">JSON 报告</a></div>`)
 
 	state := `<span class="state-idle">● 空闲</span>`
