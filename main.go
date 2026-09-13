@@ -501,14 +501,37 @@ window.cpToast=function(title,lines){
   document.getElementById('cp-toast-empty').style.display=(lines&&lines.length)?'none':'block';
   t.classList.add('show');
 };
+function swapBody(doc){
+  var toast=document.getElementById('cp-toast');
+  var fresh=doc.getElementById('cp-toast');
+  if(fresh&&fresh.parentNode)fresh.parentNode.removeChild(fresh);
+  var nodes=[toast];
+  doc.body.childNodes.forEach(function(n){nodes.push(n)});
+  document.body.replaceChildren.apply(document.body,nodes);
+  if(window.cpApply)window.cpApply();
+}
 function refreshOnce(){
   fetch('?op=status',{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
-    var doc=new DOMParser().parseFromString(html,'text/html');
-    var toast=document.getElementById('cp-toast');
-    document.body.replaceChildren.apply(document.body,[toast,...doc.body.childNodes]);
-    if(window.cpApply)window.cpApply();
+    swapBody(new DOMParser().parseFromString(html,'text/html'));
   }).catch(function(){});
 }
+var polling=false;
+function sleep(ms){return new Promise(function(res){setTimeout(res,ms)})}
+async function pollLoop(){
+  for(;;){
+    await sleep(3000);
+    try{
+      var res=await fetch('?op=status',{cache:'no-store'});
+      var html=await res.text();
+      var doc=new DOMParser().parseFromString(html,'text/html');
+      var keep=!!doc.getElementById('cp-autorefresh');
+      swapBody(doc);
+      if(!keep){polling=false;return;}
+    }catch(e){}
+  }
+}
+window.cpEnsurePoll=function(){if(!polling){polling=true;pollLoop();}};
+if(document.getElementById('cp-autorefresh'))window.cpEnsurePoll();
 document.addEventListener('click',function(e){
   var ab=e.target.closest('#btn-apply');
   if(ab){
@@ -527,7 +550,7 @@ document.addEventListener('click',function(e){
     fetch('?op=probe&format=json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
       if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
       window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
-      setTimeout(refreshOnce,800);
+      setTimeout(function(){refreshOnce();window.cpEnsurePoll();},800);
     }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
     return;
   }
@@ -685,11 +708,26 @@ func statusHTML() []byte {
 		return renderPage("context-probe", b.String(), 0)
 	}
 
+	// 实时统计（不依赖探测结束后的汇总字段）
+	statTotal, statOK, statDead, statUnknown := 0, 0, 0, 0
+	for _, pm := range rep.Providers {
+		for _, r := range pm {
+			statTotal++
+			switch r.Status {
+			case "ok":
+				statOK++
+			case "dead":
+				statDead++
+			default:
+				statUnknown++
+			}
+		}
+	}
 	b.WriteString(`<div class="card"><div class="stat-chips">` +
-		`<span class="chip" data-filter=""><span class="n">` + strconv.Itoa(rep.Total) + `</span> 合计</span>` +
-		fmt.Sprintf(`<span class="chip chip-ok" data-filter="ok" title="点击筛选可用模型"><span class="dot-ok"></span>可用 <span class="n">%d</span></span>`, rep.OK) +
-		fmt.Sprintf(`<span class="chip chip-dead" data-filter="dead" title="点击筛选死渠道"><span class="dot-dead"></span>死渠道 <span class="n">%d</span></span>`, rep.Dead) +
-		fmt.Sprintf(`<span class="chip chip-unknown" data-filter="unknown" title="点击筛选未知模型"><span class="dot-warn"></span>未知 <span class="n">%d</span></span>`, rep.Unknown) +
+		`<span class="chip" data-filter=""><span class="n">` + strconv.Itoa(statTotal) + `</span> 合计</span>` +
+		fmt.Sprintf(`<span class="chip chip-ok" data-filter="ok" title="点击筛选可用模型"><span class="dot-ok"></span>可用 <span class="n">%d</span></span>`, statOK) +
+		fmt.Sprintf(`<span class="chip chip-dead" data-filter="dead" title="点击筛选死渠道"><span class="dot-dead"></span>死渠道 <span class="n">%d</span></span>`, statDead) +
+		fmt.Sprintf(`<span class="chip chip-unknown" data-filter="unknown" title="点击筛选未知模型"><span class="dot-warn"></span>未知 <span class="n">%d</span></span>`, statUnknown) +
 		"</div></div>")
 
 	if len(rep.Applied) > 0 {
@@ -749,6 +787,7 @@ func statusHTML() []byte {
 	refresh := 0
 	if run {
 		refresh = 3
+		b.WriteString(`<span id="cp-autorefresh" hidden></span>`)
 	}
 	b.WriteString("</div>")
 	return renderPage("context-probe", b.String(), refresh)
@@ -870,6 +909,15 @@ func runProbe(onlyProvider, onlyModel string) {
 					probeMu.Lock()
 					rep.Probed++
 					rep.Current = pname + "/" + me.name
+					rep.Total++
+					switch r.Status {
+					case "ok":
+						rep.OK++
+					case "dead":
+						rep.Dead++
+					default:
+						rep.Unknown++
+					}
 					probeMu.Unlock()
 					if delay > 0 {
 						time.Sleep(delay)
