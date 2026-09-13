@@ -1,13 +1,17 @@
 # context-probe
 
-> 当前版本：**0.2.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
+> 当前版本：**0.3.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
 渠道的真实上下文 / 输出上限，并把精确的 `max-context-length` 写回 `config.yaml`
 （宿主 file watcher 自动热加载）。
 
 值解析优先级：**元数据 > 报错提取 > 已接受（声称值）> 映射表回落（仅未校验渠道）> 保持现值**。
-仅写回 `max-context-length`；`payload.override` 仍由脚本 / 手动管理。
+
+写回两个目标：
+1. `max-context-length`（上下文上限）→ 各供应商 `models` 条目内联字段；
+2. **输出上限** → 全局 `payload.override` 规则的 `params: max_tokens`（按请求模型名匹配）。
+   写回方式为**追加规则**（同名同值已覆盖则跳过；同名不同值追加新规则，宿主 last-write-wins 后置生效），不改动既有规则，避免破坏手工特例。
 
 ## 目录结构
 

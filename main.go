@@ -299,7 +299,7 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.2.0",
+			"Version":          "0.3.0",
 			"Author":           "cloudwayne",
 			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
@@ -704,7 +704,7 @@ func statusHTML() []byte {
 
 	if rep == nil {
 		b.WriteString("<div class=\"card\"><p>尚未运行探测，点击上方「开始探测」。</p></div>")
-		b.WriteString(`<p class="muted">说明：仅探测并写回 max-context-length；payload.override（全局按名匹配的 max_tokens）不由此插件管理。</p></div>`)
+		b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。</p></div>`)
 		return renderPage("context-probe", b.String(), 0)
 	}
 
@@ -782,7 +782,7 @@ func statusHTML() []byte {
 		b.WriteString("</tbody></table>")
 	}
 
-	b.WriteString(`<p class="muted">说明：仅探测并写回 max-context-length；payload.override（全局按名匹配的 max_tokens）不由此插件管理。已过期的死渠道可按本报告移除或等站方修复。</p>`)
+	b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。已过期的死渠道可按本报告移除或等站方修复。</p>`)
 
 	refresh := 0
 	if run {
@@ -1505,12 +1505,16 @@ var (
 	reMaxCtxLen = regexp.MustCompile(`(?i)maximum context length is ([0-9,]+)`)
 	reCtxTokens = regexp.MustCompile(`(?i)context length[^0-9]{0,30}([0-9,]+)\s*tokens`)
 	reGreater   = regexp.MustCompile(`(?i)must not be greater than ([0-9,]+)`)
-	reExceed    = regexp.MustCompile(`(?i)exceed[s]? (?:the )?(?:maximum|limit)[^0-9]{0,40}([0-9,]+)`)
+	reExceed    = regexp.MustCompile(`(?i)exceed[s]?\s+(?:the\s+)?(?:maximum|(?:service\s+)?limit)[^0-9]{0,40}([0-9,]+)`)
 	// less or equal to N / 不超过 N 等变体
 	reLessEq = regexp.MustCompile(`(?i)(?:should be less or equal to|less than or equal to|less or equal to|no more than|at most)\s*([0-9,]+)`)
 	// 合法范围 [1, N] / 范围[1,N]
 	reRange     = regexp.MustCompile(`(?i)(?:range|范围)[^\]】]{0,30}\[1\s*,\s*([0-9,]+)\s*\]`)
 	reOutTokens = regexp.MustCompile(`(?i)(?:output|completion)[^0-9]{0,30}([0-9,]+)\s*tokens`)
+	// N output tokens（数字在前，如 exceeds the service limit of 262144 output tokens）
+	reNumOutTokens = regexp.MustCompile(`(?i)([0-9,]+)\s+(?:output|completion)\s+tokens`)
+	// should be in [1, N]（如 field MaxTokens invalid, should be in [1, 131072]）
+	reIn        = regexp.MustCompile(`(?i)\bin\s*\[1\s*,\s*([0-9,]+)\s*\]`)
 	reAnyTokens = regexp.MustCompile(`(?i)max(?:imum)?[^0-9]{0,20}([0-9,]+)\s*tokens`)
 )
 
@@ -1547,6 +1551,14 @@ func extractLimitFromError(msg string) (string, int) {
 		}
 		return "output", num(m[1])
 	}
+	// should be in [1, N]（如 field MaxTokens invalid, should be in [1, 131072]）
+	if m := reIn.FindStringSubmatch(msg); m != nil {
+		lm := strings.ToLower(msg)
+		if strings.Contains(lm, "context") || strings.Contains(lm, "input") {
+			return "context", num(m[1])
+		}
+		return "output", num(m[1])
+	}
 	// should be less or equal to N 等
 	if m := reLessEq.FindStringSubmatch(msg); m != nil {
 		v := num(m[1])
@@ -1560,6 +1572,10 @@ func extractLimitFromError(msg string) (string, int) {
 		return "context", num(m[1])
 	}
 	if m := reOutTokens.FindStringSubmatch(msg); m != nil {
+		return "output", num(m[1])
+	}
+	// N output tokens（如 exceeds the service limit of 262144 output tokens）
+	if m := reNumOutTokens.FindStringSubmatch(msg); m != nil {
 		return "output", num(m[1])
 	}
 	if m := reAnyTokens.FindStringSubmatch(msg); m != nil {
@@ -1665,6 +1681,194 @@ func loadMapping(path string) map[string]mapVal {
 	return m
 }
 
+// ------------------------- payload.override（输出上限写回） -------------------------
+
+type outNeed struct {
+	prov string
+	pub  string
+	val  int
+	tag  string
+}
+
+func yIndent(n int) string { return strings.Repeat(" ", n) }
+
+// overrideWrites 依据探测出的输出上限生成 payload.override 追加规则（max_tokens）。
+// 只追加、不改动既有规则（宿主 last-write-wins，后置规则生效），避免破坏手工特例。
+func overrideWrites(lines []string, needs []outNeed) ([]edit, []string) {
+	if len(needs) == 0 {
+		return nil, nil
+	}
+	type ovRule struct {
+		names map[string]bool
+		val   int
+	}
+	rules := []ovRule{}
+	payloadIdx, ovIdx, ovIndent := -1, -1, 2
+	for i, l := range lines {
+		if l == "" || l[0] == ' ' || l[0] == '\t' || l[0] == '#' {
+			continue
+		}
+		if strings.HasPrefix(l, "payload:") {
+			payloadIdx = i
+			break
+		}
+	}
+	secEnd := len(lines)
+	if payloadIdx >= 0 {
+		for i := payloadIdx + 1; i < len(lines); i++ {
+			l := lines[i]
+			if l == "" || l[0] == '#' {
+				continue
+			}
+			if l[0] != ' ' && l[0] != '\t' {
+				secEnd = i
+				break
+			}
+		}
+	}
+	reOv := regexp.MustCompile(`^"?override"?:`)
+	if payloadIdx >= 0 {
+		for i := payloadIdx + 1; i < secEnd; i++ {
+			l := lines[i]
+			if strings.TrimSpace(l) == "" {
+				continue
+			}
+			ind := len(l) - len(strings.TrimLeft(l, " \t"))
+			if ind == 0 {
+				break
+			}
+			if ovIdx < 0 && reOv.MatchString(strings.TrimLeft(l, " \t")) {
+				ovIdx = i
+				ovIndent = ind
+			}
+		}
+	}
+	var starts []int
+	if ovIdx >= 0 {
+		reRule := regexp.MustCompile(`^-\s+"?models"?:`)
+		for i := ovIdx + 1; i < secEnd; i++ {
+			l := lines[i]
+			if strings.TrimSpace(l) == "" {
+				continue
+			}
+			ind := len(l) - len(strings.TrimLeft(l, " \t"))
+			if ind <= ovIndent {
+				break
+			}
+			if ind == ovIndent+2 && reRule.MatchString(strings.TrimLeft(l, " \t")) {
+				starts = append(starts, i)
+			}
+		}
+		reName := regexp.MustCompile(`^-\s+"?name"?:\s*(.+?)\s*$`)
+		reMT := regexp.MustCompile(`"?max_tokens"?:\s*([0-9,]+)`)
+		for ri, s := range starts {
+			end := secEnd
+			if ri+1 < len(starts) {
+				end = starts[ri+1]
+			}
+			names := map[string]bool{}
+			val := 0
+			for i := s; i < end; i++ {
+				l := lines[i]
+				ind := len(l) - len(strings.TrimLeft(l, " \t"))
+				trimmed := strings.TrimLeft(l, " \t")
+				if ind == ovIndent+6 {
+					if m := reName.FindStringSubmatch(trimmed); m != nil {
+						names[unquote(m[1])] = true
+					}
+				}
+				if m := reMT.FindStringSubmatch(l); m != nil && val == 0 {
+					val = num(m[1])
+				}
+			}
+			rules = append(rules, ovRule{names: names, val: val})
+		}
+	}
+
+	// 追加位置：最后一条规则末尾 / override 键后 / payload 段尾 / EOF
+	insertAt := len(lines)
+	var head []string
+	switch {
+	case ovIdx >= 0 && len(starts) > 0:
+		last := starts[len(starts)-1]
+		insertAt = secEnd
+		for i := last + 1; i < secEnd; i++ {
+			l := lines[i]
+			if strings.TrimSpace(l) == "" {
+				continue
+			}
+			ind := len(l) - len(strings.TrimLeft(l, " \t"))
+			if ind <= ovIndent {
+				insertAt = i
+				break
+			}
+		}
+	case ovIdx >= 0:
+		insertAt = ovIdx + 1
+	case payloadIdx >= 0:
+		insertAt = secEnd
+		head = []string{yIndent(ovIndent) + `"override":`}
+	default:
+		insertAt = len(lines)
+		head = []string{"", "payload:", yIndent(ovIndent) + `"override":`}
+	}
+
+	// 已被同名同值规则覆盖的跳过，其余按值分组（一组一条规则，与既有风格一致）
+	byVal := map[int][]outNeed{}
+	for _, n := range needs {
+		covered := false
+		for _, r := range rules {
+			if r.names[n.pub] && r.val == n.val {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			byVal[n.val] = append(byVal[n.val], n)
+		}
+	}
+	if len(byVal) == 0 {
+		return nil, nil
+	}
+	vals := make([]int, 0, len(byVal))
+	for v := range byVal {
+		vals = append(vals, v)
+	}
+	sort.Ints(vals)
+
+	ruleIndent, paramIndent, nameIndent := 4, 6, 8
+	if ovIdx >= 0 {
+		ruleIndent = ovIndent + 2
+		paramIndent = ovIndent + 4
+		nameIndent = ovIndent + 6
+	}
+	var block []string
+	var changes []string
+	for _, v := range vals {
+		items := byVal[v]
+		sort.Slice(items, func(i, j int) bool { return items[i].pub < items[j].pub })
+		block = append(block, yIndent(ruleIndent)+`- "models":`)
+		for _, p := range items {
+			name := strings.ReplaceAll(p.pub, `"`, `\"`)
+			block = append(block,
+				yIndent(nameIndent)+`- "name": "`+name+`"`,
+				yIndent(nameIndent+2)+`"protocol": "openai"`,
+				yIndent(nameIndent+2)+`"headers": {}`,
+				yIndent(nameIndent+2)+`"from-protocol": ""`,
+				yIndent(nameIndent+2)+`"match": []`,
+				yIndent(nameIndent+2)+`"not-match": []`,
+				yIndent(nameIndent+2)+`"exist": []`,
+				yIndent(nameIndent+2)+`"not-exist": []`)
+			changes = append(changes, "payload.override: "+p.prov+"/"+p.pub+" max_tokens→"+strconv.Itoa(v)+" ["+p.tag+"]")
+		}
+		block = append(block,
+			yIndent(paramIndent)+`"params":`,
+			yIndent(paramIndent+2)+`"max_tokens": `+strconv.Itoa(v))
+	}
+	block = append(head, block...)
+	return []edit{{idx: insertAt, op: "insert", text: strings.Join(block, "\n")}}, changes
+}
+
 // ------------------------- 写回 config.yaml -------------------------
 
 type edit struct {
@@ -1698,6 +1902,20 @@ func applyReport(rep *probeReport) ([]string, error) {
 	var edits []edit
 	var changes []string
 
+	// 输出上限收集 → payload.override（max_tokens）
+	outSeen := map[string]int{}
+	var outNeeds []outNeed
+	addOut := func(prov, pub string, v int, tag string) {
+		if v <= 0 {
+			return
+		}
+		if _, seen := outSeen[pub]; seen {
+			return
+		}
+		outSeen[pub] = v
+		outNeeds = append(outNeeds, outNeed{prov: prov, pub: pub, val: v, tag: tag})
+	}
+
 	providers := make([]string, 0, len(rep.Providers))
 	for p := range rep.Providers {
 		providers = append(providers, p)
@@ -1724,6 +1942,11 @@ func applyReport(rep *probeReport) ([]string, error) {
 				continue
 			}
 
+			// 输出上限 → payload.override（max_tokens）
+			if r.Output > 0 && r.SrcOut != "" {
+				addOut(pname, me.public, r.Output, r.SrcOut)
+			}
+
 			// 解析本次应写回的值 + 依据
 			var val int
 			var tag string
@@ -1744,8 +1967,13 @@ func applyReport(rep *probeReport) ([]string, error) {
 				val, tag = r.Context, "[官方·已接受]"
 			default:
 				// unknown / failed → 映射表回落
-				if mv, ok := mapping[strings.ToLower(me.public)]; ok && mv.Ctx > 0 {
-					val, tag = mv.Ctx, "[映射回落]"
+				if mv, ok := mapping[strings.ToLower(me.public)]; ok {
+					if mv.Ctx > 0 {
+						val, tag = mv.Ctx, "[映射回落]"
+					} else {
+						continue
+					}
+					addOut(pname, me.public, mv.Out, "[映射回落]")
 				} else {
 					continue
 				}
@@ -1779,6 +2007,11 @@ func applyReport(rep *probeReport) ([]string, error) {
 			changes = append(changes, pname+"/"+me.name+" "+old+" "+tag)
 		}
 	}
+
+	// 输出上限 → payload.override 追加规则
+	oe, och := overrideWrites(pc.lines, outNeeds)
+	edits = append(edits, oe...)
+	changes = append(changes, och...)
 
 	if len(edits) == 0 {
 		return changes, nil
