@@ -1247,8 +1247,14 @@ func parseCoreConfig(text string) *parsedConfig {
 			}
 			continue
 		}
-		if curP != nil && disabledLineRe.MatchString(raw) {
-			curP.Disabled = true
+		if curP != nil {
+			if kv := keyValueRe.FindStringSubmatch(s); kv != nil &&
+				strings.EqualFold(strings.TrimSpace(unquote(kv[1])), "disabled") {
+				switch strings.ToLower(unquote(kv[2])) {
+				case "true", "1", "yes", "y", "on":
+					curP.Disabled = true
+				}
+			}
 		}
 	}
 	return pc
@@ -1496,8 +1502,6 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 // ------------------------- 报错提取 / 失败分类 -------------------------
 
 var (
-	disabledLineRe = regexp.MustCompile(`(?i)^\s*disabled\s*:\s*(true|1|yes)\s*$`)
-
 	reMaxCtxLen = regexp.MustCompile(`(?i)maximum context length is ([0-9,]+)`)
 	reCtxTokens = regexp.MustCompile(`(?i)context length[^0-9]{0,30}([0-9,]+)\s*tokens`)
 	reGreater   = regexp.MustCompile(`(?i)must not be greater than ([0-9,]+)`)
