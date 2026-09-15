@@ -237,6 +237,60 @@ type modelResult struct {
 	Detail   []string `json:"detail,omitempty"`
 }
 
+// probeSel 记录用户在 WebUI 勾选的模型集合：provider → model(public 或 name) → true
+// 经 ?sel= 查询参数（JSON 数组 [[provider,model],...]）提交。
+type probeSel map[string]map[string]bool
+
+// count 返回选中的模型总数（去重后的 name/public 键）。
+func (s probeSel) count() int {
+	n := 0
+	for _, m := range s {
+		n += len(m)
+	}
+	return n
+}
+
+// has 判断某供应商的某模型是否被选中（name 或 public 任一命中）。
+func (s probeSel) has(provider, model string) bool {
+	if s == nil {
+		return false
+	}
+	if m, ok := s[provider]; ok && (m[model] || m[strings.ToLower(model)]) {
+		return true
+	}
+	return false
+}
+
+// parseSel 解析 ?sel= 参数：JSON 二维数组 [ ["provider","model"], ... ]。
+// 解析失败或空返回 nil（表示不限定、全量探测）。
+func parseSel(raw string) probeSel {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var pairs [][2]string
+	if err := json.Unmarshal([]byte(raw), &pairs); err != nil {
+		return nil
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	s := probeSel{}
+	for _, p := range pairs {
+		if p[0] == "" || p[1] == "" {
+			continue
+		}
+		if s[p[0]] == nil {
+			s[p[0]] = map[string]bool{}
+		}
+		s[p[0]][p[1]] = true
+		s[p[0]][strings.ToLower(p[1])] = true
+	}
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
 type probeReport struct {
 	ProbedAt  string                             `json:"probed-at"`
 	Models    int                                `json:"models"`  // 计划探测总数
@@ -299,7 +353,7 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.3.0",
+			"Version":          "0.5.0",
 			"Author":           "cloudwayne",
 			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
@@ -378,6 +432,7 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 		return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
 	case "probe":
 		provider, model := "", ""
+		var sel probeSel
 		if req.Query != nil {
 			if v, ok := req.Query["provider"]; ok && len(v) > 0 {
 				provider = v[0]
@@ -385,15 +440,22 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 			if v, ok := req.Query["model"]; ok && len(v) > 0 {
 				model = v[0]
 			}
+			if v, ok := req.Query["sel"]; ok && len(v) > 0 {
+				sel = parseSel(v[0])
+			}
 		}
 		scope := "全量"
+		selCount := sel.count()
+		if selCount > 0 {
+			scope = fmt.Sprintf("已选 %d 个模型", selCount)
+		}
 		if provider != "" {
 			scope = "供应商「" + provider + "」"
 			if model != "" {
 				scope += " 模型「" + model + "」"
 			}
 		}
-		started := startProbe(provider, model)
+		started := startProbe(provider, model, sel)
 		if req.Query != nil {
 			if v, ok := req.Query["format"]; ok && len(v) > 0 && v[0] == "json" {
 				if started {
@@ -403,11 +465,10 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 			}
 		}
 		if started {
-			return mgmtResponse(200, "text/html; charset=utf-8", renderPage("已开始探测",
-				`<div class="wrap"><h1>已开始探测（`+html.EscapeString(scope)+`）</h1><p>探测在后台运行。</p><p><a class="btn btn-primary" href="?op=status">查看状态</a></p></div>`, 0)), nil
+			// 无 JS 兜底：直接返回状态页（后台探测，页面自动显示运行中+进度），不再跳独立反馈页
+			return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
 		}
-		return mgmtResponse(200, "text/html; charset=utf-8", renderPage("探测已在运行",
-			`<div class="wrap"><h1>探测已在运行中</h1><p><a class="btn btn-primary" href="?op=status">查看状态</a></p></div>`, 0)), nil
+		return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
 	case "apply":
 		isJSON := false
 		if req.Query != nil {
@@ -485,11 +546,46 @@ window.cpApply=function(){
   document.querySelectorAll('.chip[data-filter]').forEach(function(c){
     c.classList.toggle('chip-active',f!==''&&c.dataset.filter===f);
   });
-  document.querySelectorAll('table tbody tr').forEach(function(tr){
+  document.querySelectorAll('.res-table tbody tr').forEach(function(tr){
     var td=tr.querySelector('td.st-ok,td.st-dead,td.st-unknown');
     var s=td?(td.classList.contains('st-ok')?'ok':td.classList.contains('st-dead')?'dead':'unknown'):'';
     tr.style.display=(f===''||f===s)?'':'none';
   });
+};
+// —— 模型选择状态：window.cpSel 记录勾选（键 provider\x1fname），软刷新后重放 ——
+window.cpSel={};
+window.cpSelInit=function(){
+  window.cpSel={};
+  document.querySelectorAll('.cp-sel').forEach(function(cb){
+    if(cb.checked)window.cpSel[cb.dataset.prov+'\x1f'+cb.dataset.name]=true;
+  });
+  window.cpSelApply();
+};
+window.cpSelApply=function(){
+  var n=0;
+  document.querySelectorAll('.cp-sel').forEach(function(cb){
+    var k=cb.dataset.prov+'\x1f'+cb.dataset.name;
+    cb.checked=!!window.cpSel[k];
+    if(cb.checked)n++;
+  });
+  document.querySelectorAll('.cp-prov').forEach(function(pc){
+    var p=pc.dataset.prov;
+    var cbs=document.querySelectorAll('.cp-sel[data-prov="'+p+'"]');
+    var on=0;cbs.forEach(function(cb){if(cb.checked)on++;});
+    pc.checked=on>0&&on===cbs.length;
+    pc.indeterminate=on>0&&on<cbs.length;
+  });
+  var info=document.getElementById('cp-sel-info');
+  if(info)info.innerHTML='已选 <b>'+n+'</b> 个模型';
+  // 折叠状态跨软刷新保持（未手动操作过则用服务端默认）
+  var card=document.getElementById('cp-sel-card');
+  if(card){
+    if(window.cpSelCollapsed!==undefined){
+      card.classList.toggle('collapsed',window.cpSelCollapsed);
+      var tg=document.getElementById('btn-sel-toggle');
+      if(tg)tg.textContent=window.cpSelCollapsed?'▸':'▾';
+    }
+  }
 };
 window.cpToast=function(title,lines){
   var t=document.getElementById('cp-toast');
@@ -509,6 +605,7 @@ function swapBody(doc){
   doc.body.childNodes.forEach(function(n){nodes.push(n)});
   document.body.replaceChildren.apply(document.body,nodes);
   if(window.cpApply)window.cpApply();
+  if(window.cpSelApply)window.cpSelApply();
 }
 function refreshOnce(){
   fetch('?op=status',{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
@@ -532,6 +629,25 @@ async function pollLoop(){
 }
 window.cpEnsurePoll=function(){if(!polling){polling=true;pollLoop();}};
 if(document.getElementById('cp-autorefresh'))window.cpEnsurePoll();
+if(document.querySelector('.cp-sel'))window.cpSelInit();
+var selKey=function(cb){return cb.dataset.prov+'\x1f'+cb.dataset.name;};
+document.addEventListener('change',function(e){
+  var cb=e.target;
+  if(!cb||!cb.dataset)return;
+  if(cb.classList.contains('cp-sel')){
+    if(cb.checked)window.cpSel[selKey(cb)]=true;else delete window.cpSel[selKey(cb)];
+    window.cpSelApply();
+    return;
+  }
+  if(cb.classList.contains('cp-prov')){
+    var p=cb.dataset.prov;
+    document.querySelectorAll('.cp-sel[data-prov="'+p+'"]').forEach(function(c2){
+      c2.checked=cb.checked;
+      if(cb.checked)window.cpSel[selKey(c2)]=true;else delete window.cpSel[selKey(c2)];
+    });
+    window.cpSelApply();
+  }
+});
 document.addEventListener('click',function(e){
   var ab=e.target.closest('#btn-apply');
   if(ab){
@@ -547,11 +663,62 @@ document.addEventListener('click',function(e){
   var pb=e.target.closest('#btn-probe');
   if(pb){
     e.preventDefault();
-    fetch('?op=probe&format=json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    var pairs=[];
+    Object.keys(window.cpSel||{}).forEach(function(k){
+      var i=k.indexOf('\x1f');
+      if(i>0)pairs.push([k.slice(0,i),k.slice(i+1)]);
+    });
+    if(!pairs.length){
+      window.cpToast('未选择模型',['请先勾选需要探测的模型，或使用「探测全部」']);
+      return;
+    }
+    fetch('?op=probe&format=json&sel='+encodeURIComponent(JSON.stringify(pairs)),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
       if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
       window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
       setTimeout(function(){refreshOnce();window.cpEnsurePoll();},800);
     }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
+    return;
+  }
+  // 统一处理探测类链接（探测全部 / 重试供应商 / 重试模型）：内联反馈，不跳转页面
+  var pr=e.target.closest('.cp-probe');
+  if(pr){
+    e.preventDefault();
+    var prq='?op=probe&format=json';
+    var pp=pr.dataset.prov||'', pm=pr.dataset.model||'';
+    if(pp)prq+='&provider='+encodeURIComponent(pp);
+    if(pm)prq+='&model='+encodeURIComponent(pm);
+    fetch(prq,{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+      if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
+      window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
+      setTimeout(function(){refreshOnce();window.cpEnsurePoll();},800);
+    }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
+    return;
+  }
+  // 折叠 / 展开选择卡片
+  var tg=e.target.closest('#btn-sel-toggle');
+  if(tg){
+    e.preventDefault();
+    var card=document.getElementById('cp-sel-card');
+    if(card){
+      card.classList.toggle('collapsed');
+      window.cpSelCollapsed=card.classList.contains('collapsed');
+      tg.textContent=window.cpSelCollapsed?'▸':'▾';
+    }
+    return;
+  }
+  var sa=e.target.closest('#btn-sel-all');
+  if(sa){
+    e.preventDefault();
+    document.querySelectorAll('.cp-sel:not(:disabled)').forEach(function(cb){cb.checked=true;window.cpSel[selKey(cb)]=true;});
+    window.cpSelApply();
+    return;
+  }
+  var sn=e.target.closest('#btn-sel-none');
+  if(sn){
+    e.preventDefault();
+    window.cpSel={};
+    document.querySelectorAll('.cp-sel').forEach(function(cb){cb.checked=false;});
+    window.cpSelApply();
     return;
   }
   var x=e.target.closest('#cp-toast-close');
@@ -574,6 +741,7 @@ async function poll(){
     const doc=new DOMParser().parseFromString(html,'text/html');
     document.body.replaceChildren(...doc.body.childNodes);
     if(window.cpApply)window.cpApply();
+    if(window.cpSelApply)window.cpSelApply();
   }catch(e){}
   setTimeout(poll,%d000);
 }
@@ -623,12 +791,12 @@ th,td{border:1px solid var(--border);padding:6px 10px;text-align:left;overflow:h
 th{background:var(--th-bg);font-weight:600}
 td.wrap-cell{white-space:normal;word-break:break-all}
 tr:nth-child(even) td{background:var(--row-alt)}
-th:nth-child(1),td:nth-child(1){width:24%}
-th:nth-child(2),td:nth-child(2){width:13%}
-th:nth-child(3),td:nth-child(3){width:10%}
-th:nth-child(4),td:nth-child(4){width:13%}
-th:nth-child(5),td:nth-child(5){width:10%}
-th:nth-child(6),td:nth-child(6){width:9%}
+.res-table th:nth-child(1),.res-table td:nth-child(1){width:24%}
+.res-table th:nth-child(2),.res-table td:nth-child(2){width:13%}
+.res-table th:nth-child(3),.res-table td:nth-child(3){width:10%}
+.res-table th:nth-child(4),.res-table td:nth-child(4){width:13%}
+.res-table th:nth-child(5),.res-table td:nth-child(5){width:10%}
+.res-table th:nth-child(6),.res-table td:nth-child(6){width:9%}
 .st-ok{color:var(--ok)}.st-dead{color:var(--dead)}.st-unknown{color:var(--warn)}
 code{background:var(--th-bg);padding:1px 5px;border-radius:4px;font-size:12px}
 ul.applied{margin:4px 0;padding-left:20px;font-size:12px;color:var(--muted)}
@@ -643,6 +811,27 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .toast .empty{margin:0;font-size:12px;color:var(--muted)}
 .toast-x{position:absolute;top:8px;right:10px;border:none;background:none;color:var(--muted);font-size:14px;cursor:pointer;line-height:1}
 .toast-x:hover{color:var(--text)}
+/* 模型选择区 */
+.sel-head{display:flex;align-items:center;gap:10px;margin:0 0 4px;flex-wrap:wrap}
+.btn-mini{padding:2px 10px;font-size:12px;line-height:1.6}
+#cp-sel-card.collapsed .sel-body{display:none}
+.sel-toolbar{display:flex;gap:10px;align-items:center;margin:2px 0 10px;flex-wrap:wrap}
+.prov-head{display:flex;align-items:center;gap:8px;margin:16px 0 4px;font-size:14px;font-weight:600;flex-wrap:wrap}
+.prov-head:first-of-type{margin-top:0}
+.prov-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.prov-label input{margin:0;width:15px;height:15px}
+.sel-table{table-layout:fixed}
+.sel-table th, .sel-table td{padding:4px 8px}
+.sel-table td.ck, .sel-table th.ck{width:32px;text-align:center}
+.sel-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle}
+.sel-table th:nth-child(1){width:32px}
+.sel-table th:nth-child(2){width:auto}
+.sel-table th:nth-child(3){width:28%}
+.sel-table th:nth-child(4){width:18%}
+.sel-table th:nth-child(5){width:14%}
+.prov-off,.row-off{opacity:.45}
+.badge{display:inline-block;padding:0 8px;border-radius:10px;font-size:11px;font-weight:500}
+.badge-off{color:var(--muted);border:1px solid var(--border)}
 </style>
 <div id="cp-toast" class="toast"><button id="cp-toast-close" class="toast-x" title="关闭">✕</button><h3 id="cp-toast-title"></h3><ul id="cp-toast-list"></ul><p id="cp-toast-empty" class="empty">没有需要写回的变更</p></div>` + bodyHTML + "</body></html>"
 	return []byte(s)
@@ -662,6 +851,7 @@ func statusHTML() []byte {
 		`<a class="btn" id="btn-apply" href="?op=apply">⬇ 应用写回</a>` +
 		`<a class="btn" href="?op=report" target="_blank">JSON 报告</a></div>`)
 
+	// 状态卡片（进度/结果优先，探测中实时刷新）
 	state := `<span class="state-idle">● 空闲</span>`
 	if run {
 		state = `<span class="state-run">● 运行中…</span>`
@@ -703,7 +893,9 @@ func statusHTML() []byte {
 		" · delay=" + strconv.FormatFloat(cfg.DelaySecs, 'f', -1, 64) + "s</p>")
 
 	if rep == nil {
-		b.WriteString("<div class=\"card\"><p>尚未运行探测，点击上方「开始探测」。</p></div>")
+		// 首次无报告：选择卡片展开供勾选，放最前
+		b.WriteString(selectionCardHTML(rep, run))
+		b.WriteString(`<div class="card"><p>尚未运行探测。在上方勾选模型后点击「开始探测」。</p></div>`)
 		b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。</p></div>`)
 		return renderPage("context-probe", b.String(), 0)
 	}
@@ -753,8 +945,8 @@ func statusHTML() []byte {
 		sort.Strings(names)
 		q := url.QueryEscape(pname)
 		b.WriteString("<h2>" + html.EscapeString(pname) +
-			` <a class="mini" href="?op=probe&provider=` + q + `">↻ 重试该供应商</a></h2>`)
-		b.WriteString("<table><thead><tr><th>模型</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>状态</th><th>详情</th></tr></thead><tbody>")
+			` <a class="mini cp-probe" href="?op=probe&provider=` + q + `" data-prov="` + html.EscapeString(pname) + `" data-model="" title="只重试该供应商全部模型">↻ 重试该供应商</a></h2>`)
+		b.WriteString("<table class=\"res-table\"><thead><tr><th>模型</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>状态</th><th>详情</th></tr></thead><tbody>")
 		for _, n := range names {
 			r := models[n]
 			cls, label := "st-ok", r.Status
@@ -776,11 +968,14 @@ func statusHTML() []byte {
 			b.WriteString("<tr><td>" + html.EscapeString(r.Public) + "</td><td>" + ctxV + "</td><td>" +
 				html.EscapeString(r.SrcCtx) + "</td><td>" + outV + "</td><td>" +
 				html.EscapeString(r.SrcOut) + "</td><td class=\"" + cls + "\">" + label +
-				` <a class="mini" href="?op=probe&provider=` + q + `&model=` + mq + `">↻</a></td><td class=` + "\"wrap-cell muted\">" +
+				` <a class="mini cp-probe" href="?op=probe&provider=` + q + `&model=` + mq + `" data-prov="` + html.EscapeString(pname) + `" data-model="` + html.EscapeString(firstNonEmpty(r.Name, r.Public)) + `" title="只重试该模型">↻</a></td><td class=` + "\"wrap-cell muted\">" +
 				html.EscapeString(detail) + "</td></tr>")
 		}
 		b.WriteString("</tbody></table>")
 	}
+
+	// 有报告后：选择卡片折叠置于结果下方（结果优先）
+	b.WriteString(selectionCardHTML(rep, run))
 
 	b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。已过期的死渠道可按本报告移除或等站方修复。</p>`)
 
@@ -793,9 +988,133 @@ func statusHTML() []byte {
 	return renderPage("context-probe", b.String(), refresh)
 }
 
+// selectionCardHTML 渲染「选择要探测的模型」卡片：
+// 解析 config.yaml 现有配置，按供应商分组列出模型及现有信息（内部名/别名/现有 max-context-length/上次状态），
+// 每行 checkbox（勾选后仅探测选中模型），供应商级 checkbox 全选该供应商。
+// 有报告或探测运行时默认折叠（结果优先），首次无报告时展开供勾选。
+func selectionCardHTML(rep *probeReport, run bool) string {
+	var b strings.Builder
+	collapsed := rep != nil || run
+	b.WriteString(`<div class="card` + map[bool]string{true: " collapsed", false: ""}[collapsed] + `" id="cp-sel-card">`)
+	// 标题行：折叠开关 + 计数 + 探测全部（折叠时也能一键全量探测）
+	b.WriteString(`<div class="sel-head">` +
+		`<h2 style="margin:0">① 选择要探测的模型</h2>` +
+		`<button class="btn btn-mini" id="btn-sel-toggle" type="button" title="展开/折叠">` + map[bool]string{true: "▸", false: "▾"}[collapsed] + `</button>` +
+		`<span class="muted" id="cp-sel-info">已选 <b>0</b> 个模型</span>` +
+		`<a class="mini cp-probe" href="?op=probe" data-prov="" data-model="" title="忽略勾选，探测全部可用模型">探测全部</a></div>`)
+	b.WriteString(`<p class="muted" style="margin:2px 0 6px">勾选需要探测的模型（按供应商分组，显示配置中现有信息），点击「开始探测」后仅对选中的模型发起探测。</p>`)
+
+	configPath, err := resolveConfigPath()
+	if err != nil {
+		b.WriteString(`<p class="muted">` + html.EscapeString(err.Error()) + `</p></div>`)
+		return b.String()
+	}
+	raw, rerr := os.ReadFile(configPath)
+	if rerr != nil {
+		b.WriteString(`<p class="muted">读取 config.yaml 失败：` + html.EscapeString(rerr.Error()) + `</p></div>`)
+		return b.String()
+	}
+	pc := parseCoreConfig(string(raw))
+	mapping := loadMapping(mappingPathFor(configPath))
+
+	b.WriteString(`<div class="sel-body">`)
+	// 工具栏：全选 / 全不选 / 已选计数
+	b.WriteString(`<div class="sel-toolbar">` +
+		`<button class="btn" id="btn-sel-all" type="button">全选</button>` +
+		`<button class="btn" id="btn-sel-none" type="button">全不选</button></div>`)
+
+	probeable := func(p *providerInfo) bool {
+		return p != nil && !p.Disabled && p.BaseURL != "" && len(p.APIKeys) > 0
+	}
+
+	anyModel := false
+	for _, pname := range pc.order {
+		p := pc.providers[pname]
+		models := pc.modelsOf(pname)
+		if len(models) == 0 {
+			continue
+		}
+		anyModel = true
+		q := url.QueryEscape(pname)
+		ok := probeable(p)
+		badge := ""
+		if !ok {
+			if p != nil && p.Disabled {
+				badge = `<span class="badge badge-off">已停用</span>`
+			} else if p != nil && (p.BaseURL == "" || len(p.APIKeys) == 0) {
+				badge = `<span class="badge badge-off">无地址/密钥</span>`
+			}
+		}
+		base := ""
+		if p != nil {
+			base = html.EscapeString(p.BaseURL)
+		}
+		b.WriteString(`<h3 class="prov-head` + map[bool]string{true: "", false: " prov-off"}[ok] + `">` +
+			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"` + boolAttr(!ok) + `> <b>` + html.EscapeString(pname) + `</b></label>` +
+			`<span class="muted">` + base + `</span>` + badge +
+			`<span class="muted">` + strconv.Itoa(len(models)) + ` 个模型</span>` +
+			` <a class="mini cp-probe" href="?op=probe&provider=` + q + `" data-prov="` + html.EscapeString(pname) + `" data-model="" title="只重试该供应商全部模型">↻ 重试该供应商</a></h3>`)
+		b.WriteString(`<table class="sel-table"><thead><tr><th class="ck"></th><th>模型</th><th>内部名 / 别名</th><th>现有上下文</th><th>上次状态</th></tr></thead><tbody>`)
+		for _, me := range models {
+			// 现有信息：config 现值 + 映射表参考值
+			ctxV := "—"
+			if me.maxclVal > 0 {
+				ctxV = strconv.Itoa(me.maxclVal)
+			} else if mv, okm := mapping[strings.ToLower(me.public)]; okm && mv.Ctx > 0 {
+				ctxV = strconv.Itoa(mv.Ctx) + `<span class="muted">（映射）</span>`
+			}
+			nameAlias := ""
+			parts := []string{}
+			if me.name != "" {
+				parts = append(parts, me.name)
+			}
+			if me.alias != "" && me.alias != me.name && me.alias != me.public {
+				parts = append(parts, "别名 "+me.alias)
+			}
+			nameAlias = html.EscapeString(strings.Join(parts, " · "))
+			// 上次状态
+			stCls, stLabel := "muted", "—"
+			if rep != nil {
+				if pm, okr := rep.Providers[pname]; okr {
+					if r, okr2 := pm[me.public]; okr2 && r != nil {
+						switch r.Status {
+						case "ok":
+							stCls, stLabel = "st-ok", "可用"
+						case "dead":
+							stCls, stLabel = "st-dead", "死渠道"
+						default:
+							stCls, stLabel = "st-unknown", "未知"
+						}
+					}
+				}
+			}
+			b.WriteString(`<tr class="` + map[bool]string{true: "", false: "row-off"}[ok] + `"><td class="ck">` +
+				`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"` + boolAttr(!ok) + `></td>` +
+				`<td>` + html.EscapeString(me.public) + `</td>` +
+				`<td class="muted">` + nameAlias + `</td>` +
+				`<td>` + ctxV + `</td>` +
+				`<td class="` + stCls + `">` + stLabel + `</td></tr>`)
+		}
+		b.WriteString("</tbody></table>")
+	}
+	if !anyModel {
+		b.WriteString(`<p class="muted">config.yaml 中未发现 openai-compatibility 模型条目。</p>`)
+	}
+	b.WriteString(`</div>`)
+	b.WriteString("</div>")
+	return b.String()
+}
+
+func boolAttr(off bool) string {
+	if off {
+		return " disabled"
+	}
+	return ""
+}
+
 // ------------------------- 探测引擎 -------------------------
 
-func startProbe(onlyProvider, onlyModel string) bool {
+func startProbe(onlyProvider, onlyModel string, sel probeSel) bool {
 	probeMu.Lock()
 	defer probeMu.Unlock()
 	if running {
@@ -803,7 +1122,7 @@ func startProbe(onlyProvider, onlyModel string) bool {
 	}
 	running = true
 	probeStop = false
-	go runProbe(onlyProvider, onlyModel)
+	go runProbe(onlyProvider, onlyModel, sel)
 	return true
 }
 
@@ -811,8 +1130,9 @@ func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
 }
 
-func runProbe(onlyProvider, onlyModel string) {
-	targeted := onlyProvider != ""
+func runProbe(onlyProvider, onlyModel string, sel probeSel) {
+	selMode := len(sel) > 0
+	targeted := onlyProvider != "" || selMode
 	var rep *probeReport
 	if targeted {
 		// 定点重试：合并进现有报告，不清空其它供应商结果
@@ -847,8 +1167,13 @@ func runProbe(onlyProvider, onlyModel string) {
 				if p == nil || p.Disabled || p.BaseURL == "" || len(p.APIKeys) == 0 {
 					return false
 				}
-				if targeted && pname != onlyProvider {
+				if onlyProvider != "" && pname != onlyProvider {
 					return false
+				}
+				if selMode {
+					if _, ok := sel[pname]; !ok {
+						return false
+					}
 				}
 				if filter != "" && !strings.Contains(strings.ToLower(pname), filter) &&
 					!strings.Contains(strings.ToLower(p.BaseURL), filter) {
@@ -857,7 +1182,13 @@ func runProbe(onlyProvider, onlyModel string) {
 				return true
 			}
 			matchModel := func(me *modelEntry) bool {
-				return onlyModel == "" || me.name == onlyModel || me.public == onlyModel
+				if onlyModel != "" {
+					return me.name == onlyModel || me.public == onlyModel
+				}
+				if selMode {
+					return sel.has(me.provider, me.name) || sel.has(me.provider, me.public)
+				}
+				return true
 			}
 
 			// 计划探测总数（同样应用过滤条件）
@@ -896,7 +1227,8 @@ func runProbe(onlyProvider, onlyModel string) {
 				}
 				key := p.APIKeys[0]
 				baseURL := strings.TrimRight(p.BaseURL, "/")
-				meta := fetchMetadata(baseURL, key, timeout)
+				hdrs := providerHeaders(p)
+				meta := fetchMetadata(baseURL, key, hdrs, timeout)
 				for _, me := range models {
 					if stopped() {
 						break
@@ -904,7 +1236,7 @@ func runProbe(onlyProvider, onlyModel string) {
 					if !matchModel(me) {
 						continue
 					}
-					r := probeModel(baseURL, key, me, meta, mapping, timeout)
+					r := probeModel(baseURL, key, me, meta, mapping, hdrs, timeout)
 					pm[r.Public] = r
 					probeMu.Lock()
 					rep.Probed++
@@ -1049,7 +1381,23 @@ func httpDo(method, target string, headers map[string][]string, body []byte, tim
 	}
 }
 
-func chatProbe(baseURL, key, model string, maxTokens int, timeout time.Duration) (int, []byte, error) {
+// providerHeaders 把供应商配置的自定义请求头转为探测请求用 map；
+// $ 前缀的动态值（宿主从下游客户端请求复制）探测时无法还原，跳过。
+func providerHeaders(p *providerInfo) map[string][]string {
+	out := map[string][]string{}
+	if p == nil {
+		return out
+	}
+	for k, v := range p.Headers {
+		if k == "" || strings.HasPrefix(v, "$") {
+			continue
+		}
+		out[k] = []string{v}
+	}
+	return out
+}
+
+func chatProbe(baseURL, key, model string, headers map[string][]string, maxTokens int, timeout time.Duration) (int, []byte, error) {
 	payload := map[string]any{
 		"model":      model,
 		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
@@ -1057,10 +1405,16 @@ func chatProbe(baseURL, key, model string, maxTokens int, timeout time.Duration)
 		"stream":     false,
 	}
 	body, _ := json.Marshal(payload)
-	return httpDo("POST", baseURL+"/chat/completions", map[string][]string{
+	// 与宿主 openai_compat_executor 一致：先设默认头，再用供应商自定义头覆盖（含 UA 可被覆盖）
+	hdrs := map[string][]string{
 		"Authorization": {"Bearer " + key},
 		"Content-Type":  {"application/json"},
-	}, body, timeout)
+		"User-Agent":    {"cli-proxy-openai-compat"},
+	}
+	for k, v := range headers {
+		hdrs[k] = v
+	}
+	return httpDo("POST", baseURL+"/chat/completions", hdrs, body, timeout)
 }
 
 // ------------------------- 配置解析 -------------------------
@@ -1070,6 +1424,8 @@ type providerInfo struct {
 	BaseURL  string
 	APIKeys  []string
 	Disabled bool
+	// Headers 供应商配置的自定义请求头（headers: 键，静态值；$ 前缀动态值不在此还原）
+	Headers map[string]string
 }
 
 type modelEntry struct {
@@ -1117,6 +1473,7 @@ func parseCoreConfig(text string) *parsedConfig {
 	section := ""
 	var curProvider *providerInfo
 	inModels := false
+	inHeaders := false
 	cur := (*modelEntry)(nil)
 
 	for i, raw := range lines {
@@ -1154,6 +1511,7 @@ func parseCoreConfig(text string) *parsedConfig {
 				// 供应商项
 				cur = nil
 				inModels = false
+				inHeaders = false
 				if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "name") {
 					nm := unquote(kv[2])
 					if existing, ok := pc.providers[nm]; ok {
@@ -1169,6 +1527,8 @@ func parseCoreConfig(text string) *parsedConfig {
 				continue
 			}
 			if curProvider != nil && indent == 6 {
+				// 列表项（模型 / api-key）：结束 headers 块
+				inHeaders = false
 				if inModels {
 					cur = &modelEntry{provider: curProvider.Name, itemIdx: i, maxclIdx: -1}
 					if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "name") {
@@ -1197,7 +1557,9 @@ func parseCoreConfig(text string) *parsedConfig {
 		}
 		key := strings.ToLower(unquote(kv[1]))
 		val := unquote(kv[2])
+		rawKey := unquote(kv[1])
 		if curProvider != nil && cur == nil && indent <= 4 {
+			inHeaders = false
 			switch key {
 			case "base-url":
 				curProvider.BaseURL = val
@@ -1207,6 +1569,21 @@ func parseCoreConfig(text string) *parsedConfig {
 				inModels = true
 			case "api-key-entries":
 				inModels = false
+			case "headers":
+				inHeaders = true
+				if curProvider.Headers == nil {
+					curProvider.Headers = map[string]string{}
+				}
+			}
+			continue
+		}
+		if inHeaders && curProvider != nil && cur == nil && indent >= 6 {
+			// headers 块内的键值对：保留原始大小写；$ 前缀动态值原样保留，由 providerHeaders 在请求时过滤
+			if rawKey != "" {
+				if curProvider.Headers == nil {
+					curProvider.Headers = map[string]string{}
+				}
+				curProvider.Headers[rawKey] = val
 			}
 			continue
 		}
@@ -1270,10 +1647,15 @@ type metaModel struct {
 	ctx, out int
 }
 
-func fetchMetadata(baseURL, key string, timeout time.Duration) *metaLimits {
-	st, body, err := httpDo("GET", baseURL+"/models", map[string][]string{
+func fetchMetadata(baseURL, key string, headers map[string][]string, timeout time.Duration) *metaLimits {
+	hdrs := map[string][]string{
 		"Authorization": {"Bearer " + key},
-	}, nil, timeout)
+		"User-Agent":    {"cli-proxy-openai-compat"},
+	}
+	for k, v := range headers {
+		hdrs[k] = v
+	}
+	st, body, err := httpDo("GET", baseURL+"/models", hdrs, nil, timeout)
 	if err != nil || st != 200 {
 		return nil
 	}
@@ -1352,7 +1734,7 @@ func matchMetadata(meta *metaLimits, model string) (int, int, bool) {
 
 // ------------------------- 探测单个模型 -------------------------
 
-func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping map[string]mapVal, timeout time.Duration) *modelResult {
+func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping map[string]mapVal, headers map[string][]string, timeout time.Duration) *modelResult {
 	r := &modelResult{Provider: me.provider, Name: me.name, Public: me.public, Status: "unknown"}
 	detail := []string{}
 
@@ -1393,7 +1775,7 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 	if probeCtx <= 0 {
 		probeCtx = 1000000 // 声称默认
 	}
-	st1, body1, err1 := chatProbe(baseURL, key, me.name, probeCtx, timeout)
+	st1, body1, err1 := chatProbe(baseURL, key, me.name, headers, probeCtx, timeout)
 	if err1 != nil {
 		detail = append(detail, "probe1 请求失败: "+err1.Error())
 	} else if st1 >= 200 && st1 < 300 {
@@ -1404,7 +1786,7 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 		}
 		detail = append(detail, fmt.Sprintf("probe1: max_tokens=%d 被接受", probeCtx))
 		if claimedOut > 0 {
-			st2, body2, err2 := chatProbe(baseURL, key, me.name, claimedOut, timeout)
+			st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, claimedOut, timeout)
 			if err2 != nil {
 				detail = append(detail, "probe2 请求失败: "+err2.Error())
 			} else if st2 >= 200 && st2 < 300 {
@@ -1452,7 +1834,7 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 						retry = val
 					}
 					if retry > 0 && retry != probeCtx {
-						st2, body2, err2 := chatProbe(baseURL, key, me.name, retry, timeout)
+						st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, retry, timeout)
 						if err2 != nil {
 							detail = append(detail, "probe2(修正) 请求失败: "+err2.Error())
 						} else if st2 >= 200 && st2 < 300 {
@@ -1469,7 +1851,7 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 			}
 			// 若 context 已定而 output 未知，补一测
 			if kind == "context" && claimedOut > 0 {
-				st2, body2, err2 := chatProbe(baseURL, key, me.name, claimedOut, timeout)
+				st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, claimedOut, timeout)
 				if err2 != nil {
 					detail = append(detail, "probe2 请求失败: "+err2.Error())
 				} else if st2 >= 200 && st2 < 300 {
@@ -2046,15 +2428,15 @@ const indentOfItem = 6
 
 func unquote(s string) string {
 	s = strings.TrimSpace(s)
-	quoted := false
-	if len(s) >= 2 && ((s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'')) {
-		s = s[1 : len(s)-1]
-		quoted = true
-	}
-	if !quoted {
-		if idx := strings.Index(s, " #"); idx >= 0 {
-			s = s[:idx]
+	// 带引号的值后面可能跟行尾注释（如 "x" # 注释）：取首个配对引号内的内容
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') {
+		if end := strings.IndexByte(s[1:], s[0]); end >= 0 {
+			return s[1 : 1+end]
 		}
+	}
+	// 裸值：剥离行尾注释
+	if idx := strings.Index(s, " #"); idx >= 0 {
+		s = s[:idx]
 	}
 	return strings.TrimSpace(s)
 }

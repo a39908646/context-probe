@@ -1,6 +1,6 @@
 # context-probe
 
-> 当前版本：**0.3.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
+> 当前版本：**0.5.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
 渠道的真实上下文 / 输出上限，并把精确的 `max-context-length` 写回 `config.yaml`
@@ -69,9 +69,10 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 
 ## 功能页（Management API `/probe`）
 
-- **开始探测**：后台全量探测，页面 3 秒软刷新（无闪烁），显示进度条 + 当前探测模型；
-- **状态筛选**：点击「可用 / 死渠道 / 未知」徽章筛选表格行；
-- **单点重试**：供应商标题旁 ↻ 重试整个供应商；模型行状态旁 ↻ 只重试该模型
+- **模型选择**：页面顶部按供应商分组列出全部已配置模型（含现有 `max-context-length`、内部名/别名、停用标记、上次探测状态），勾选需要探测的模型（供应商级全选 / 全选 / 全不选）；
+- **开始探测**：仅对勾选的模型发起后台探测（`?op=probe&sel=[[provider,model],...]`），页面 3 秒软刷新（无闪烁），显示进度条 + 当前探测模型；未勾选时提示先选择；「探测全部」忽略勾选探测全部可用模型（兼容旧行为）；
+- **状态筛选**：点击「可用 / 死渠道 / 未知」徽章筛选结果表行；
+- **单点重试**：供应商标题旁 ↻ 重试整个供应商；结果表模型行状态旁 ↻ 只重试该模型
   （`?op=probe&provider=X&model=Y`），结果合并进现有报告，不影响其它结果；
 - **应用写回**：按报告把 `max-context-length` 写回 `config.yaml`（自动备份 `.bak.plugin.<时间戳>`）；
 - **JSON 报告**：查看 / 下载 `model-context-probe.json`。
@@ -92,4 +93,5 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 
 - 429（并发/限流）、502/503/504（网关不可用）标记为**临时失败**（状态「未知」），可单点重试；
 - 已停用（`disabled: true`）的供应商不参与探测；
+- **自定义请求头**：探测请求（chat/completions 与 /models 元数据）会带上供应商 `headers:` 中的静态自定义头，并发送宿主同款 `User-Agent: cli-proxy-openai-compat`；`$` 前缀的动态值（宿主从下游客户端请求复制）探测时无法还原，自动跳过；自定义头可覆盖默认 Authorization/Content-Type/UA（与宿主行为一致）；
 - 探测只读，写回仅改动 `max-context-length` 一项。
