@@ -1558,7 +1558,9 @@ func parseCoreConfig(text string) *parsedConfig {
 		key := strings.ToLower(unquote(kv[1]))
 		val := unquote(kv[2])
 		rawKey := unquote(kv[1])
-		if curProvider != nil && cur == nil && indent <= 4 {
+		if curProvider != nil && indent <= 4 {
+			// 供应商级键（可能在 models 块之后，如 prefix/headers）：重置当前模型
+			cur = nil
 			inHeaders = false
 			switch key {
 			case "base-url":
