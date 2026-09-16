@@ -437,12 +437,22 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 			}
 		}
 		if view == "probe" {
+			setLastView("probe")
+			return mgmtResponse(200, "text/html; charset=utf-8", probeHTML()), nil
+		}
+		if view == "list" {
+			setLastView("list")
+			return mgmtResponse(200, "text/html; charset=utf-8", listHTML()), nil
+		}
+		// 未显式指定 view（如整页刷新）：沿用上次视图，避免探测页刷新后跳回列表页
+		if getLastView() == "probe" {
 			return mgmtResponse(200, "text/html; charset=utf-8", probeHTML()), nil
 		}
 		return mgmtResponse(200, "text/html; charset=utf-8", listHTML()), nil
 	case "probe":
 		provider, model := "", ""
 		var sel probeSel
+		fresh := false
 		if req.Query != nil {
 			if v, ok := req.Query["provider"]; ok && len(v) > 0 {
 				provider = v[0]
@@ -452,6 +462,9 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 			}
 			if v, ok := req.Query["sel"]; ok && len(v) > 0 {
 				sel = parseSel(v[0])
+			}
+			if v, ok := req.Query["fresh"]; ok && len(v) > 0 && v[0] == "1" {
+				fresh = true // 全新一轮：清掉上一轮报告，仅保留本轮参与的模型
 			}
 		}
 		scope := "全量"
@@ -465,7 +478,10 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 				scope += " 模型「" + model + "」"
 			}
 		}
-		started := startProbe(provider, model, sel)
+		started := startProbe(provider, model, sel, fresh)
+		if started {
+			setLastView("probe")
+		}
 		if req.Query != nil {
 			if v, ok := req.Query["format"]; ok && len(v) > 0 && v[0] == "json" {
 				if started {
@@ -650,7 +666,9 @@ async function pollLoop(){
   }
 }
 window.cpEnsurePoll=function(){if(!polling){polling=true;pollLoop();}};
-if(document.getElementById('cp-autorefresh'))window.cpEnsurePoll();
+// cp-autorefresh 标记位于页面末尾，脚本执行时可能尚未入 DOM：等 DOM 就绪后再判定
+function cpInitPoll(){if(document.getElementById('cp-autorefresh'))window.cpEnsurePoll();}
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',cpInitPoll);}else{cpInitPoll();}
 if(document.querySelector('.cp-sel'))window.cpSelInit();
 var selKey=function(cb){return cb.dataset.prov+'\x1f'+cb.dataset.name;};
 document.addEventListener('change',function(e){
@@ -690,19 +708,21 @@ document.addEventListener('click',function(e){
     });
     return pairs;
   }
-  function cpRunProbe(nav){
+  function cpRunProbe(nav,fresh){
     var pairs=cpPairs();
     if(!pairs.length){window.cpToast('未选择模型',['请先勾选需要探测的模型']);return;}
-    fetch('?op=probe&format=json&sel='+encodeURIComponent(JSON.stringify(pairs)),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    var q='?op=probe&format=json';
+    if(fresh)q+='&fresh=1';
+    fetch(q+'&sel='+encodeURIComponent(JSON.stringify(pairs)),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
       if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
       window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
       if(nav){window.cpNav(nav);}else{setTimeout(function(){refreshOnce();window.cpEnsurePoll();},600);}
     }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
   }
   var pb=e.target.closest('#btn-probe');
-  if(pb){e.preventDefault();cpRunProbe('probe');return;}
+  if(pb){e.preventDefault();cpRunProbe('probe',true);return;}
   var rb=e.target.closest('#btn-retry');
-  if(rb){e.preventDefault();cpRunProbe(null);return;}
+  if(rb){e.preventDefault();cpRunProbe(null,false);return;}
   var fb=e.target.closest('#btn-finish');
   if(fb){e.preventDefault();window.cpNav('list');return;}
   var fd=e.target.closest('.cp-fold');
@@ -764,28 +784,7 @@ document.addEventListener('click',function(e){
 });
 })();
 </script>`
-	if refresh > 0 {
-		// 软刷新：fetch 局部替换 body，避免整页重载闪烁
-		script += fmt.Sprintf(`<script>
-function cpPollQS2(){
-  var el=document.getElementById('cp-poll');
-  return el&&el.dataset.qs?('&'+el.dataset.qs):'';
-}
-async function poll(){
-  try{
-    const res=await fetch('?op=status'+cpPollQS2(),{cache:'no-store'});
-    const html=await res.text();
-    const doc=new DOMParser().parseFromString(html,'text/html');
-    document.body.replaceChildren(...doc.body.childNodes);
-    if(window.cpApply)window.cpApply();
-    if(window.cpSelApply)window.cpSelApply();
-  }catch(e){}
-  setTimeout(poll,%d000);
-}
-setTimeout(poll,%d000);
-</script>`, refresh, refresh)
-	}
-	// 样式与脚本放在 <body> 内：宿主 SPA 可能只抽取 body 内容嵌入渲染
+	// 轮询统一由常驻脚本的 pollLoop 负责（cp-autorefresh 存在时启用，探测结束自动停止）
 	s := `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>` + html.EscapeString(title) + `</title></head><body>` +
 		script +
 		`<style>
@@ -949,10 +948,22 @@ func probeHTML() []byte {
 	b.WriteString("</div>")
 
 	if rep == nil {
-		b.WriteString(`<div class="card"><p class="muted">尚无探测数据。请返回模型列表页勾选模型后点击「开始探测」。</p></div>`)
+		b.WriteString(`<div class="card"><p class="muted">尚无探测数据。`)
+		if run {
+			// 刚开始探测、报告尚未就绪：启动轮询，数据创建后自动刷出
+			b.WriteString(`正在准备探测…`)
+		} else {
+			b.WriteString(`请返回模型列表页勾选模型后点击「开始探测」。`)
+		}
+		b.WriteString(`</p></div>`)
 		b.WriteString(fabProbe())
+		refresh := 0
+		if run {
+			refresh = 3
+			b.WriteString(`<span id="cp-autorefresh" hidden></span>`)
+		}
 		b.WriteString(`<span id="cp-poll" data-qs="view=probe" hidden></span></div>`)
-		return renderPage("context-probe · 探测", b.String(), 0)
+		return renderPage("context-probe · 探测", b.String(), refresh)
 	}
 
 	// 实时统计（不依赖探测结束后的汇总字段）
@@ -1193,7 +1204,23 @@ func fabProbe() string {
 
 // ------------------------- 探测引擎 -------------------------
 
-func startProbe(onlyProvider, onlyModel string, sel probeSel) bool {
+// lastView 记录最近一次展示的视图（"list" / "probe"），整页刷新时沿用，
+// 避免探测页刷新后跳回模型列表页。
+var lastView = "list"
+
+func setLastView(v string) {
+	probeMu.Lock()
+	lastView = v
+	probeMu.Unlock()
+}
+
+func getLastView() string {
+	probeMu.Lock()
+	defer probeMu.Unlock()
+	return lastView
+}
+
+func startProbe(onlyProvider, onlyModel string, sel probeSel, fresh bool) bool {
 	probeMu.Lock()
 	defer probeMu.Unlock()
 	if running {
@@ -1201,7 +1228,7 @@ func startProbe(onlyProvider, onlyModel string, sel probeSel) bool {
 	}
 	running = true
 	probeStop = false
-	go runProbe(onlyProvider, onlyModel, sel)
+	go runProbe(onlyProvider, onlyModel, sel, fresh)
 	return true
 }
 
@@ -1209,9 +1236,10 @@ func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
 }
 
-func runProbe(onlyProvider, onlyModel string, sel probeSel) {
+func runProbe(onlyProvider, onlyModel string, sel probeSel, fresh bool) {
 	selMode := len(sel) > 0
-	targeted := onlyProvider != "" || selMode
+	// fresh=true（列表页发起的新一轮）不算定点重试：清空旧报告，仅本轮参与模型入表
+	targeted := (onlyProvider != "" || selMode) && !fresh
 	var rep *probeReport
 	if targeted {
 		// 定点重试：合并进现有报告，不清空其它供应商结果
@@ -1323,7 +1351,7 @@ func runProbe(onlyProvider, onlyModel string, sel probeSel) {
 					if !matchModel(me) {
 						continue
 					}
-					r := probeModel(baseURL, key, me, meta, hdrs, timeout)
+					r := probeModel(baseURL, key, me, meta, hdrs, timeout, fresh)
 					pm[r.Public] = r
 					probeMu.Lock()
 					rep.Probed++
@@ -1488,6 +1516,44 @@ func chatProbeContent(baseURL, key, model string, headers map[string][]string, c
 		hdrs[k] = v
 	}
 	return httpDo("POST", baseURL+"/chat/completions", hdrs, body, timeout)
+}
+
+// chatProbeWithRetry 对传输层失败（EOF / connection reset / 超时等，服务端直接断连，
+// 常见为瞬时问题）自动重试有限次，避免单次抖动把模型误判为不可用。
+func chatProbeWithRetry(baseURL, key, model string, headers map[string][]string, maxTokens int, timeout time.Duration) (int, []byte, error) {
+	var st int
+	var body []byte
+	var err error
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * 2 * time.Second) // 2s / 4s 递增退避
+		}
+		st, body, err = chatProbe(baseURL, key, model, headers, maxTokens, timeout)
+		if err == nil {
+			return st, body, nil
+		}
+		if !isTransientNetErr(err) {
+			return st, body, err // 非瞬时错误（如 URL 非法）不重试
+		}
+	}
+	return st, body, err
+}
+
+var reNetTransient = regexp.MustCompile(`EOF|connection reset|broken pipe|connection refused|tls:|timeout|context deadline|no such host|temporary failure|i/o timeout|server closed idle connection`)
+
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return reNetTransient.MatchString(strings.ToLower(err.Error()))
+}
+
+func transientNetNote(err error) string {
+	if !isTransientNetErr(err) {
+		return ""
+	}
+	return "网络层瞬时失败（连接被对端断开/超时），已自动重试仍失败；可稍后对该模型单点重试"
 }
 
 // probeContextByInput 用超大输入 + max_tokens=1 触发渠道的上下文长度报错，从报错里提取真实上下文窗口。
@@ -1873,13 +1939,15 @@ const defaultProbeTokens = 1500000
 // contextProbeChars 上下文补探的输入长度（字符）：随机十六进制串，确保 token 数超过现有模型窗口。
 const contextProbeChars = 6000000
 
-func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, headers map[string][]string, timeout time.Duration) *modelResult {
+func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, headers map[string][]string, timeout time.Duration, fresh bool) *modelResult {
 	r := &modelResult{Provider: me.provider, Name: me.name, Public: me.public, Status: "unknown"}
 	detail := []string{}
 
 	// 探测起点：config 现值 → 默认 1500000（足够大，触发渠道报错以提取真实上限）
+	// fresh=true（全新一轮）时忽略 config 现值（可能是上一轮回写的历史值，
+	// 如渠道对大 max_tokens 直接超时/断连会卡死探测），改用默认大起点重新逼报错提取
 	probeCtx, ctxSrc := defaultProbeTokens, "默认"
-	if me.maxclVal > 0 {
+	if !fresh && me.maxclVal > 0 {
 		probeCtx, ctxSrc = me.maxclVal, "config现值"
 	}
 	detail = append(detail, fmt.Sprintf("候选: config现值=%d → 起点=%d(%s)", me.maxclVal, probeCtx, ctxSrc))
@@ -1906,9 +1974,12 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, headers m
 		return r
 	}
 
-	st1, body1, err1 := chatProbe(baseURL, key, me.name, headers, probeCtx, timeout)
+	st1, body1, err1 := chatProbeWithRetry(baseURL, key, me.name, headers, probeCtx, timeout)
 	if err1 != nil {
 		detail = append(detail, "probe1 请求失败: "+err1.Error())
+		if isTransientNetErr(err1) {
+			detail = append(detail, transientNetNote(err1))
+		}
 	} else if st1 >= 200 && st1 < 300 {
 		if ctxSrc == "默认" {
 			// 仅「极大值被接受」，探不到真实窗口 → 标未知，不写回
