@@ -1,12 +1,17 @@
 # context-probe
 
-> 当前版本：**0.5.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
+> 当前版本：**0.8.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
-渠道的真实上下文 / 输出上限，并把精确的 `max-context-length` 写回 `config.yaml`
+渠道的真实上下文上限（输出上限仅在接口明确给出时取用），并把精确的 `max-context-length` 写回 `config.yaml`
 （宿主 file watcher 自动热加载）。
 
-值解析优先级：**元数据 > 报错提取 > 已接受（声称值）> 映射表回落（仅未校验渠道）> 保持现值**。
+值解析优先级：**元数据 > 报错提取 > 已接受（config 现值）> 保持现值**。
+
+探测起点（真正发出去的 `max_tokens`）按优先级取：`config.yaml` 现值 → 默认 **1500000**。
+默认值刻意取得足够大：渠道几乎必定报错，插件即从报错文本提取真实上限（上下文 / 输出）并回写 `config.yaml`。
+输出上限不再主动探测：仅当接口**明确给出**（`/models` 元数据或报错文本中的合法上限）时才写回，接口不给值时保持不写。
+若站点报错只提输出上限、不提上下文，插件会用「超大输入 + `max_tokens=1`」**自动再探一次**逼出上下文上限（无需手动触发）。
 
 写回两个目标：
 1. `max-context-length`（上下文上限）→ 各供应商 `models` 条目内联字段；
@@ -82,7 +87,6 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 | 键 | 类型 | 默认 | 说明 |
 |----|------|------|------|
 | `config_path` | string | 自动探测 | config.yaml 路径 |
-| `mapping_path` | string | 同目录 `model-context-map.json` | 映射表（未校验渠道回落值） |
 | `providers` | string | 空 | 供应商过滤（子串，逗号分隔，空 = 全部） |
 | `probe_timeout_seconds` | int | 60 | 单请求超时秒数 |
 | `probe_delay_seconds` | float | 0.3 | 请求间隔秒数 |
@@ -94,4 +98,6 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 - 429（并发/限流）、502/503/504（网关不可用）标记为**临时失败**（状态「未知」），可单点重试；
 - 已停用（`disabled: true`）的供应商不参与探测；
 - **自定义请求头**：探测请求（chat/completions 与 /models 元数据）会带上供应商 `headers:` 中的静态自定义头，并发送宿主同款 `User-Agent: cli-proxy-openai-compat`；`$` 前缀的动态值（宿主从下游客户端请求复制）探测时无法还原，自动跳过；自定义头可覆盖默认 Authorization/Content-Type/UA（与宿主行为一致）；
-- 探测只读，写回仅改动 `max-context-length` 一项。
+- **上下文自动补探**：probe1 用 `max_tokens=1500000` 触发报错。若报错只暴露了输出上限、没提上下文（部分站点先校验 `max_tokens`），插件会**自动**再发一次「超大输入 + `max_tokens=1`」的探测请求，逼出 `maximum context length is N` 之类的报错并提取上下文，**无需手动再触发**；输入按 token 估算取足够大（随机串防 BPE 压缩），遇 413/请求体过大自动缩小重试。
+- **输出上限（max_tokens）**：不再主动探测。仅当接口**明确返回**时才写回 `payload.override` 的 `max_tokens`——来源为 `/models` 元数据，或 probe1 报错文本中明确给出的合法上限；接口不报错/不给值时不写入（避免写入虚高假值）。
+- 探测只读，写回仅改动 `max-context-length` 与 `payload.override` 的 `max_tokens`（后者仅在明确值时）。

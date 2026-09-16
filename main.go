@@ -1,11 +1,11 @@
 // context-probe —— CLIProxyAPI 标准动态库插件（Management API 能力）。
 //
-// 功能：探测各 openai-compatibility 渠道的真实上下文/输出上限，并把精确的
+// 功能：探测各 openai-compatibility 渠道的真实上下文上限，并把精确的
 // max-context-length 写回 config.yaml（宿主 file watcher 自动热加载）。
 //
-// 值解析顺序：元数据 > 报错提取 > 已接受(声称值) > 映射表回落(仅未校验渠道) > 保持现值。
-// 映射表(model-context-map.json)只作为探测未校验(未知)渠道的回落值，无独立写入模式。
-// 仅写回 max-context-length；payload.override 仍由脚本/手动管理（全局按名匹配）。
+// 值解析顺序：元数据 > 报错提取 > 已接受(config现值) > 保持现值。
+// 探测起点：config 现值 → 默认 1500000（足够大，触发渠道报错以提取真实上下文后回写）。
+// 输出上限：不再主动探测，仅当接口明确给出（/models 元数据或报错文本）时才写入 payload.override 的 max_tokens。
 //
 // 安装位置：plugins/ 或 plugins/<goos>/<goarch>/，文件名即插件 ID（context-probe.dll）。
 package main
@@ -217,7 +217,6 @@ func callHost(method string, payload []byte) (json.RawMessage, error) {
 
 type pluginConfig struct {
 	ConfigPath   string
-	MappingPath  string
 	Providers    string
 	TimeoutSecs  int
 	DelaySecs    float64
@@ -323,7 +322,7 @@ func handleMethod(method string, reqRaw []byte) ([]byte, error) {
 			"resources": []map[string]any{{
 				"Path":        "/probe",
 				"Menu":        "Context Probe",
-				"Description": "渠道上下文/输出上限探测与写回（元数据 > 报错提取 > 已接受 > 映射回落）",
+				"Description": "渠道上下文/输出上限探测与写回（元数据 > 报错提取 > 已接受）",
 			}},
 		}), nil
 	case "management.handle":
@@ -353,12 +352,11 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.5.0",
+			"Version":          "0.8.0",
 			"Author":           "cloudwayne",
 			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
 				{"Name": "config_path", "Type": "string", "Description": "config.yaml 路径（默认自动探测 cpa-core/config.yaml）"},
-				{"Name": "mapping_path", "Type": "string", "Description": "映射表路径（未校验渠道回落值）"},
 				{"Name": "providers", "Type": "string", "Description": "供应商过滤（子串，逗号分隔，空=全部）"},
 				{"Name": "probe_timeout_seconds", "Type": "int", "Description": "单请求超时秒数（默认 60）"},
 				{"Name": "probe_delay_seconds", "Type": "float", "Description": "请求间隔秒数（默认 0.3）"},
@@ -392,8 +390,6 @@ func applyPluginConfig(text string) {
 		switch key {
 		case "config_path":
 			cfg.ConfigPath = val
-		case "mapping_path":
-			cfg.MappingPath = val
 		case "providers":
 			cfg.Providers = val
 		case "probe_timeout_seconds":
@@ -886,7 +882,6 @@ func statusHTML() []byte {
 	b.WriteString("</div>")
 
 	b.WriteString(`<p class="muted">config_path=` + html.EscapeString(cfg.ConfigPath) +
-		" · mapping_path=" + html.EscapeString(cfg.MappingPath) +
 		" · providers=[" + html.EscapeString(cfg.Providers) + "]" +
 		" · auto_apply=" + strconv.FormatBool(cfg.AutoApply) +
 		" · timeout=" + strconv.Itoa(cfg.TimeoutSecs) + "s" +
@@ -1015,7 +1010,6 @@ func selectionCardHTML(rep *probeReport, run bool) string {
 		return b.String()
 	}
 	pc := parseCoreConfig(string(raw))
-	mapping := loadMapping(mappingPathFor(configPath))
 
 	b.WriteString(`<div class="sel-body">`)
 	// 工具栏：全选 / 全不选 / 已选计数
@@ -1056,12 +1050,10 @@ func selectionCardHTML(rep *probeReport, run bool) string {
 			` <a class="mini cp-probe" href="?op=probe&provider=` + q + `" data-prov="` + html.EscapeString(pname) + `" data-model="" title="只重试该供应商全部模型">↻ 重试该供应商</a></h3>`)
 		b.WriteString(`<table class="sel-table"><thead><tr><th class="ck"></th><th>模型</th><th>内部名 / 别名</th><th>现有上下文</th><th>上次状态</th></tr></thead><tbody>`)
 		for _, me := range models {
-			// 现有信息：config 现值 + 映射表参考值
+			// 现有信息：config 现值
 			ctxV := "—"
 			if me.maxclVal > 0 {
 				ctxV = strconv.Itoa(me.maxclVal)
-			} else if mv, okm := mapping[strings.ToLower(me.public)]; okm && mv.Ctx > 0 {
-				ctxV = strconv.Itoa(mv.Ctx) + `<span class="muted">（映射）</span>`
 			}
 			nameAlias := ""
 			parts := []string{}
@@ -1155,7 +1147,6 @@ func runProbe(onlyProvider, onlyModel string, sel probeSel) {
 		raw, rerr := os.ReadFile(configPath)
 		if rerr == nil {
 			pc := parseCoreConfig(string(raw))
-			mapping := loadMapping(mappingPathFor(configPath))
 			timeout := time.Duration(cfg.TimeoutSecs) * time.Second
 			if timeout <= 0 {
 				timeout = 60 * time.Second
@@ -1236,7 +1227,7 @@ func runProbe(onlyProvider, onlyModel string, sel probeSel) {
 					if !matchModel(me) {
 						continue
 					}
-					r := probeModel(baseURL, key, me, meta, mapping, hdrs, timeout)
+					r := probeModel(baseURL, key, me, meta, hdrs, timeout)
 					pm[r.Public] = r
 					probeMu.Lock()
 					rep.Probed++
@@ -1319,25 +1310,6 @@ func resolveConfigPath() (string, error) {
 	return "", fmt.Errorf("找不到 config.yaml（可在 plugins.configs.context-probe.config_path 指定）")
 }
 
-func mappingPathFor(configPath string) string {
-	if cfg.MappingPath != "" {
-		if filepath.IsAbs(cfg.MappingPath) {
-			return cfg.MappingPath
-		}
-		return filepath.Join(filepath.Dir(configPath), cfg.MappingPath)
-	}
-	p := filepath.Join(filepath.Dir(configPath), "model-context-map.json")
-	if _, err := os.Stat(p); err == nil {
-		return p
-	}
-	if abs, err := filepath.Abs("model-context-map.json"); err == nil {
-		if _, err := os.Stat(abs); err == nil {
-			return abs
-		}
-	}
-	return p
-}
-
 // ------------------------- host.http.do -------------------------
 
 func httpDo(method, target string, headers map[string][]string, body []byte, timeout time.Duration) (int, []byte, error) {
@@ -1398,9 +1370,14 @@ func providerHeaders(p *providerInfo) map[string][]string {
 }
 
 func chatProbe(baseURL, key, model string, headers map[string][]string, maxTokens int, timeout time.Duration) (int, []byte, error) {
+	return chatProbeContent(baseURL, key, model, headers, "hi", maxTokens, timeout)
+}
+
+// chatProbeContent 与 chatProbe 相同，但可自定义 user 内容（用于超大输入触发上下文报错）。
+func chatProbeContent(baseURL, key, model string, headers map[string][]string, content string, maxTokens int, timeout time.Duration) (int, []byte, error) {
 	payload := map[string]any{
 		"model":      model,
-		"messages":   []map[string]string{{"role": "user", "content": "hi"}},
+		"messages":   []map[string]string{{"role": "user", "content": content}},
 		"max_tokens": maxTokens,
 		"stream":     false,
 	}
@@ -1415,6 +1392,63 @@ func chatProbe(baseURL, key, model string, headers map[string][]string, maxToken
 		hdrs[k] = v
 	}
 	return httpDo("POST", baseURL+"/chat/completions", hdrs, body, timeout)
+}
+
+// probeContextByInput 用超大输入 + max_tokens=1 触发渠道的上下文长度报错，从报错里提取真实上下文窗口。
+// 自动执行，无需手动触发；请求体过大（413 等）时缩小输入重试（有限次）。
+// 用高熵随机串避免 BPE 过度压缩而 token 数不足。
+func probeContextByInput(baseURL, key, model string, headers map[string][]string, timeout time.Duration) (int, []string) {
+	notes := []string{}
+	for attempt, n := 0, contextProbeChars; attempt < 3; attempt, n = attempt+1, n/4 {
+		st, body, err := chatProbeContent(baseURL, key, model, headers, randomHex(n), 1, timeout)
+		if err != nil {
+			notes = append(notes, "上下文补探 请求失败: "+err.Error())
+			return 0, notes
+		}
+		msg := errorMessage(body)
+		low := strings.ToLower(msg)
+		if st >= 200 && st < 300 {
+			notes = append(notes, fmt.Sprintf("上下文补探: 输入 %d 字符被接受（窗口更大或未校验，上下文仍未知）", n))
+			return 0, notes
+		}
+		if st == 413 || strings.Contains(low, "too large") || strings.Contains(low, "payload") || strings.Contains(low, "request entity") {
+			notes = append(notes, fmt.Sprintf("上下文补探: 输入 %d 字符 HTTP %d（请求体过大，缩小重试）", n, st))
+			continue
+		}
+		if kind, val := extractLimitFromError(msg); val > 0 {
+			if kind == "context" {
+				notes = append(notes, fmt.Sprintf("上下文补探: 输入 %d 字符 → 报错提取 context=%d", n, val))
+				return val, notes
+			}
+			notes = append(notes, fmt.Sprintf("上下文补探: 输入 %d 字符 → 报错提取 %s=%d（非上下文）", n, kind, val))
+			return 0, notes
+		}
+		notes = append(notes, fmt.Sprintf("上下文补探: 输入 %d 字符 HTTP %d %s", n, st, firstN(msg, 140)))
+		return 0, notes
+	}
+	return 0, notes
+}
+
+// randomHex 生成 n 个十六进制字符的高熵串（xorshift，无需加密强度）。
+func randomHex(n int) string {
+	const hexd = "0123456789abcdef"
+	b := make([]byte, n)
+	var s uint64 = 0x9E3779B97F4A7C15
+	for i := range b {
+		s ^= s << 13
+		s ^= s >> 7
+		s ^= s << 17
+		b[i] = hexd[s&0xf]
+	}
+	return string(b)
+}
+
+// firstN 截断过长文本用于详情显示。
+func firstN(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 // ------------------------- 配置解析 -------------------------
@@ -1736,20 +1770,23 @@ func matchMetadata(meta *metaLimits, model string) (int, int, bool) {
 
 // ------------------------- 探测单个模型 -------------------------
 
-func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping map[string]mapVal, headers map[string][]string, timeout time.Duration) *modelResult {
+// defaultProbeTokens 默认探测值：取得足够大，使渠道几乎必定报错，
+// 再从报错文本中提取真实上限（上下文 / 输出）。当前无模型超过该值。
+const defaultProbeTokens = 1500000
+
+// contextProbeChars 上下文补探的输入长度（字符）：随机十六进制串，确保 token 数超过现有模型窗口。
+const contextProbeChars = 6000000
+
+func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, headers map[string][]string, timeout time.Duration) *modelResult {
 	r := &modelResult{Provider: me.provider, Name: me.name, Public: me.public, Status: "unknown"}
 	detail := []string{}
 
-	claimedCtx := me.maxclVal
-	if claimedCtx <= 0 {
-		if mv, ok := mapping[strings.ToLower(me.public)]; ok && mv.Ctx > 0 {
-			claimedCtx = mv.Ctx
-		}
+	// 探测起点：config 现值 → 默认 1500000（足够大，触发渠道报错以提取真实上限）
+	probeCtx, ctxSrc := defaultProbeTokens, "默认"
+	if me.maxclVal > 0 {
+		probeCtx, ctxSrc = me.maxclVal, "config现值"
 	}
-	claimedOut := 0
-	if mv, ok := mapping[strings.ToLower(me.public)]; ok {
-		claimedOut = mv.Out
-	}
+	detail = append(detail, fmt.Sprintf("候选: config现值=%d → 起点=%d(%s)", me.maxclVal, probeCtx, ctxSrc))
 
 	// 元数据（强证据）
 	if ctx, out, ok := matchMetadata(meta, me.name); ok {
@@ -1773,40 +1810,24 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 		return r
 	}
 
-	probeCtx := claimedCtx
-	if probeCtx <= 0 {
-		probeCtx = 1000000 // 声称默认
-	}
 	st1, body1, err1 := chatProbe(baseURL, key, me.name, headers, probeCtx, timeout)
 	if err1 != nil {
 		detail = append(detail, "probe1 请求失败: "+err1.Error())
 	} else if st1 >= 200 && st1 < 300 {
-		if claimedCtx > 0 {
-			r.Context, r.SrcCtx = claimedCtx, "官方·已接受"
+		if ctxSrc == "默认" {
+			// 仅「极大值被接受」，探不到真实窗口 → 标未知，不写回
+			detail = append(detail, fmt.Sprintf("probe1: max_tokens=%d 被接受（渠道未校验，上下文未知）", probeCtx))
 		} else {
 			r.Context, r.SrcCtx = probeCtx, "官方·已接受"
+			detail = append(detail, fmt.Sprintf("probe1: max_tokens=%d 被接受（%s）", probeCtx, ctxSrc))
 		}
-		detail = append(detail, fmt.Sprintf("probe1: max_tokens=%d 被接受", probeCtx))
-		if claimedOut > 0 {
-			st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, claimedOut, timeout)
-			if err2 != nil {
-				detail = append(detail, "probe2 请求失败: "+err2.Error())
-			} else if st2 >= 200 && st2 < 300 {
-				r.Output, r.SrcOut = claimedOut, "官方·已接受"
-				detail = append(detail, fmt.Sprintf("probe2: max_tokens=%d 被接受", claimedOut))
-			} else {
-				msg := errorMessage(body2)
-				if msg != "" {
-					detail = append(detail, "probe2: HTTP "+strconv.Itoa(st2)+" "+msg)
-				}
-				if kind, val := extractLimitFromError(msg); val > 0 {
-					if kind == "output" {
-						r.Output, r.SrcOut = val, "报错提取"
-					} else {
-						r.Context, r.SrcCtx = val, "报错提取"
-					}
-				}
+		// 上下文未知 → 用超大输入自动补探（无需手动触发）
+		if r.Context == 0 {
+			v, ns := probeContextByInput(baseURL, key, me.name, headers, timeout)
+			if v > 0 {
+				r.Context, r.SrcCtx = v, "报错提取"
 			}
+			detail = append(detail, ns...)
 		}
 	} else {
 		msg := errorMessage(body1)
@@ -1828,48 +1849,21 @@ func probeModel(baseURL, key string, me *modelEntry, meta *metaLimits, mapping m
 				r.Context, r.SrcCtx = val, "报错提取"
 			}
 			detail = append(detail, "从报错提取上限")
-			if kind == "output" {
-				// max_tokens 被拒 → 用修正后的输出上限复测上下文（无元数据上下文时）
-				if r.Context == 0 {
-					retry := probeCtx
-					if val > 0 && retry > val {
-						retry = val
-					}
-					if retry > 0 && retry != probeCtx {
-						st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, retry, timeout)
-						if err2 != nil {
-							detail = append(detail, "probe2(修正) 请求失败: "+err2.Error())
-						} else if st2 >= 200 && st2 < 300 {
-							r.Context, r.SrcCtx = retry, "官方·已接受"
-							detail = append(detail, fmt.Sprintf("probe2(修正): max_tokens=%d 被接受", retry))
-						} else {
-							m2 := errorMessage(body2)
-							if k2, v2 := extractLimitFromError(m2); v2 > 0 && k2 == "context" {
-								r.Context, r.SrcCtx = v2, "报错提取"
-							}
-						}
-					}
+			if kind == "output" && r.Context == 0 {
+				// max_tokens 被拒只暴露了输出上限 → 用超大输入自动补探上下文（无需手动触发）
+				v, ns := probeContextByInput(baseURL, key, me.name, headers, timeout)
+				if v > 0 {
+					r.Context, r.SrcCtx = v, "报错提取"
 				}
-			}
-			// 若 context 已定而 output 未知，补一测
-			if kind == "context" && claimedOut > 0 {
-				st2, body2, err2 := chatProbe(baseURL, key, me.name, headers, claimedOut, timeout)
-				if err2 != nil {
-					detail = append(detail, "probe2 请求失败: "+err2.Error())
-				} else if st2 >= 200 && st2 < 300 {
-					r.Output, r.SrcOut = claimedOut, "官方·已接受"
-				} else {
-					m2 := errorMessage(body2)
-					if k2, v2 := extractLimitFromError(m2); v2 > 0 {
-						if k2 == "output" {
-							r.Output, r.SrcOut = v2, "报错提取"
-						} else {
-							r.Context, r.SrcCtx = v2, "报错提取"
-						}
-					}
-				}
+				detail = append(detail, ns...)
 			}
 		}
+	}
+
+	// 一致性：输出上限不得超过上下文窗口（输出 ≤ 上下文）
+	if r.Context > 0 && r.Output > r.Context {
+		detail = append(detail, fmt.Sprintf("警示: 输出上限 %d > 上下文 %d，忽略输出值", r.Output, r.Context))
+		r.Output, r.SrcOut = 0, ""
 	}
 
 	if r.Status != "dead" {
@@ -2024,45 +2018,6 @@ func errorMessage(body []byte) string {
 		s = s[:300] + "…"
 	}
 	return s
-}
-
-// ------------------------- 映射表（未校验渠道回落） -------------------------
-
-type mapVal struct {
-	Ctx, Out int
-}
-
-func loadMapping(path string) map[string]mapVal {
-	m := map[string]mapVal{}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return m
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return m
-	}
-	for k, v := range doc {
-		if strings.HasPrefix(k, "_") {
-			continue
-		}
-		mv := mapVal{}
-		switch vv := v.(type) {
-		case float64:
-			mv.Ctx = int(vv)
-		case map[string]any:
-			if f, ok := vv["context"].(float64); ok {
-				mv.Ctx = int(f)
-			}
-			if f, ok := vv["output"].(float64); ok {
-				mv.Out = int(f)
-			}
-		}
-		if mv.Ctx > 0 || mv.Out > 0 {
-			m[strings.ToLower(k)] = mv
-		}
-	}
-	return m
 }
 
 // ------------------------- payload.override（输出上限写回） -------------------------
@@ -2273,7 +2228,6 @@ func applyReport(rep *probeReport) ([]string, error) {
 	text := string(raw)
 	crlf := strings.Contains(text, "\r\n")
 	pc := parseCoreConfig(text)
-	mapping := loadMapping(mappingPathFor(configPath))
 
 	byKey := map[string]*modelEntry{}
 	for _, me := range pc.models {
@@ -2350,17 +2304,8 @@ func applyReport(rep *probeReport) ([]string, error) {
 				}
 				val, tag = r.Context, "[官方·已接受]"
 			default:
-				// unknown / failed → 映射表回落
-				if mv, ok := mapping[strings.ToLower(me.public)]; ok {
-					if mv.Ctx > 0 {
-						val, tag = mv.Ctx, "[映射回落]"
-					} else {
-						continue
-					}
-					addOut(pname, me.public, mv.Out, "[映射回落]")
-				} else {
-					continue
-				}
+				// unknown / failed → 保持现值，不写回
+				continue
 			}
 			if exit {
 				continue
