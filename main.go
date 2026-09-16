@@ -87,7 +87,7 @@ const rpcSchemaVersion uint32 = 6 // 与宿主 pluginabi.SchemaVersion 一致，
 // 宿主规范：非空、不以 v 开头、匹配 ^[0-9][0-9A-Za-z.+-]*$（见 internal/pluginstore/registry.go）；
 // 更新检测按点分整数逐段比较，故用纯数字点分（如 0.9.1）最稳。
 // README 顶部「当前版本」行由构建脚本/测试自动同步，勿手改。
-const pluginVersion = "0.9.1"
+const pluginVersion = "0.9.2"
 
 // ------------------------- ABI -------------------------
 
@@ -876,7 +876,7 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .prov-card{padding:12px 16px}
 .prov-head{display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:14px;font-weight:600;flex-wrap:wrap}
 .prov-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
-.prov-label input{margin:0;width:15px;height:15px}
+.prov-label input{margin:0;width:15px;height:15px;appearance:auto;-webkit-appearance:checkbox;accent-color:var(--accent);cursor:pointer}
 .prov-body{overflow-x:auto}
 .prov-body.hidden{display:none}
 .mdl-table{table-layout:fixed}
@@ -889,7 +889,7 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .mdl-table th:nth-child(6),.mdl-table td:nth-child(6){width:10%}
 .mdl-table th:nth-child(7),.mdl-table td:nth-child(7){width:10%}
 .mdl-table td.ck, .mdl-table th.ck{width:30px;text-align:center}
-.mdl-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle}
+.mdl-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle;appearance:auto;-webkit-appearance:checkbox;accent-color:var(--accent);cursor:pointer}
 .st-pending{color:var(--accent)}
 </style>
 <div id="cp-toast" class="toast"><button id="cp-toast-close" class="toast-x" title="关闭">✕</button><h3 id="cp-toast-title"></h3><ul id="cp-toast-list"></ul><p id="cp-toast-empty" class="empty">没有需要写回的变更</p></div>` + bodyHTML + "</body></html>"
@@ -1004,7 +1004,7 @@ func probeHTML() []byte {
 		pid := "pbody-" + html.EscapeString(pname)
 		b.WriteString(`<div class="card prov-card">`)
 		b.WriteString(`<div class="prov-head">` +
-			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"> <b>` + html.EscapeString(pname) + `</b></label>` +
+			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `" title="勾选/取消该供应商全部模型"> <b>` + html.EscapeString(pname) + `</b></label>` +
 			`<span class="muted">` + strconv.Itoa(len(names)) + ` 个模型</span>` +
 			`<button class="btn btn-mini cp-fold" type="button" data-target="` + pid + `" title="折叠/展开">▾</button></div>`)
 		b.WriteString(`<div class="prov-body" id="` + pid + `">`)
@@ -1024,7 +1024,7 @@ func probeHTML() []byte {
 			}
 			detail := strings.Join(r.Detail, "; ")
 			b.WriteString(`<tr class="cp-row"><td class="ck">` +
-				`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(firstNonEmpty(r.Name, r.Public)) + `" checked></td>` +
+				`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(firstNonEmpty(r.Name, r.Public)) + `" checked title="勾选后参与重试"></td>` +
 				`<td>` + html.EscapeString(r.Public) + `</td><td>` + ctxV + `</td><td class="muted">` +
 				html.EscapeString(r.SrcCtx) + `</td><td>` + outV + `</td><td class="muted">` +
 				html.EscapeString(r.SrcOut) + `</td><td class="` + cls + `">` + label + `</td><td class="wrap-cell muted">` +
@@ -1100,7 +1100,7 @@ func listHTML() []byte {
 		pid := "prov-" + html.EscapeString(pname)
 		b.WriteString(`<div class="card prov-card">`)
 		b.WriteString(`<div class="prov-head">` +
-			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"> <b>` + html.EscapeString(pname) + `</b></label>` +
+			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `" title="勾选/取消该供应商全部模型"> <b>` + html.EscapeString(pname) + `</b></label>` +
 			`<span class="muted">` + base + `</span>` +
 			`<span class="muted">` + strconv.Itoa(len(models)) + ` 个模型</span>` +
 			`<button class="btn btn-mini cp-fold" type="button" data-target="` + pid + `" title="折叠/展开">▾</button></div>`)
@@ -1145,7 +1145,7 @@ func listRow(pname string, me *modelEntry, rep *probeReport) string {
 		srcCtx = "config 现值"
 	}
 	return `<tr class="cp-row"><td class="ck">` +
-		`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"></td>` +
+		`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `" title="勾选后参与探测"></td>` +
 		`<td>` + html.EscapeString(me.public) + `</td>` +
 		`<td>` + ctxV + `</td><td class="muted">` + html.EscapeString(srcCtx) + `</td>` +
 		`<td>` + outV + `</td><td class="muted">` + html.EscapeString(srcOut) + `</td>` +
