@@ -87,7 +87,7 @@ const rpcSchemaVersion uint32 = 6 // 与宿主 pluginabi.SchemaVersion 一致，
 // 宿主规范：非空、不以 v 开头、匹配 ^[0-9][0-9A-Za-z.+-]*$（见 internal/pluginstore/registry.go）；
 // 更新检测按点分整数逐段比较，故用纯数字点分（如 0.9.1）最稳。
 // README 顶部「当前版本」行由构建脚本/测试自动同步，勿手改。
-const pluginVersion = "0.9.2"
+const pluginVersion = "0.9.3"
 
 // ------------------------- ABI -------------------------
 
@@ -888,7 +888,7 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .mdl-table th:nth-child(5),.mdl-table td:nth-child(5){width:11%}
 .mdl-table th:nth-child(6),.mdl-table td:nth-child(6){width:10%}
 .mdl-table th:nth-child(7),.mdl-table td:nth-child(7){width:10%}
-.mdl-table td.ck, .mdl-table th.ck{width:30px;text-align:center}
+.mdl-table td.ck, .mdl-table th.ck{width:34px;text-align:center;padding-left:3px;padding-right:3px;text-overflow:clip}
 .mdl-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle;appearance:auto;-webkit-appearance:checkbox;accent-color:var(--accent);cursor:pointer}
 .st-pending{color:var(--accent)}
 </style>

@@ -1,6 +1,6 @@
 # context-probe
 
-> 当前版本：**0.9.2**（唯一手写处为 `main.go` 的 `pluginVersion`；本行由构建脚本 / `go test -run TestReadmeVersionInSync -update` 自动同步。
+> 当前版本：**0.9.3**（唯一手写处为 `main.go` 的 `pluginVersion`；本行由构建脚本 / `go test -run TestReadmeVersionInSync -update` 自动同步。
 > 版本规范（宿主校验）：非空、**不以 `v` 开头**、匹配 `^[0-9][0-9A-Za-z.+-]*$`；更新检测按点分整数逐段比较，故推荐纯数字点分 `MAJOR.MINOR.PATCH`）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
