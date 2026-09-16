@@ -6,6 +6,8 @@ command -v go >/dev/null || { echo "未找到 go，请先安装 Go >= 1.24"; exi
 mkdir -p dist
 ext=so
 [[ "$(go env GOOS)" == "windows" ]] && ext=dll
+# 同步 README 顶部版本行到 main.go 的 pluginVersion（版本号单处定义）
+go test -run TestReadmeVersionInSync -update . >/dev/null
 go vet .
 go build -buildmode=c-shared -o "dist/context-probe.$ext" .
 echo "构建完成: dist/context-probe.$ext"

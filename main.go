@@ -83,6 +83,12 @@ import (
 const abiVersion uint32 = 1
 const rpcSchemaVersion uint32 = 6 // 与宿主 pluginabi.SchemaVersion 一致，raw JSON 响应（不 HTML 转义）
 
+// pluginVersion 插件发布版本（唯一手写处）。
+// 宿主规范：非空、不以 v 开头、匹配 ^[0-9][0-9A-Za-z.+-]*$（见 internal/pluginstore/registry.go）；
+// 更新检测按点分整数逐段比较，故用纯数字点分（如 0.9.1）最稳。
+// README 顶部「当前版本」行由构建脚本/测试自动同步，勿手改。
+const pluginVersion = "0.9.1"
+
 // ------------------------- ABI -------------------------
 
 type envelope struct {
@@ -351,7 +357,7 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.9.0",
+			"Version":          pluginVersion,
 			"Author":           "cloudwayne",
 			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
@@ -873,8 +879,15 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .prov-label input{margin:0;width:15px;height:15px}
 .prov-body{overflow-x:auto}
 .prov-body.hidden{display:none}
-.mdl-table{table-layout:auto}
+.mdl-table{table-layout:fixed}
 .mdl-table th, .mdl-table td{padding:4px 8px}
+.mdl-table th:nth-child(1),.mdl-table td:nth-child(1){width:30px}
+.mdl-table th:nth-child(2),.mdl-table td:nth-child(2){width:26%}
+.mdl-table th:nth-child(3),.mdl-table td:nth-child(3){width:11%}
+.mdl-table th:nth-child(4),.mdl-table td:nth-child(4){width:10%}
+.mdl-table th:nth-child(5),.mdl-table td:nth-child(5){width:11%}
+.mdl-table th:nth-child(6),.mdl-table td:nth-child(6){width:10%}
+.mdl-table th:nth-child(7),.mdl-table td:nth-child(7){width:10%}
 .mdl-table td.ck, .mdl-table th.ck{width:30px;text-align:center}
 .mdl-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle}
 .st-pending{color:var(--accent)}
@@ -1075,40 +1088,31 @@ func listHTML() []byte {
 	anyModel := false
 	for _, pname := range pc.order {
 		p := pc.providers[pname]
+		if !probeable(p) {
+			continue // 未启用/不可探测的供应商不可选，不展示
+		}
 		models := pc.modelsOf(pname)
 		if len(models) == 0 {
 			continue
 		}
 		anyModel = true
-		ok := probeable(p)
-		badge := ""
-		if !ok {
-			if p != nil && p.Disabled {
-				badge = `<span class="badge badge-off">已停用</span>`
-			} else if p != nil && (p.BaseURL == "" || len(p.APIKeys) == 0) {
-				badge = `<span class="badge badge-off">无地址/密钥</span>`
-			}
-		}
-		base := ""
-		if p != nil {
-			base = html.EscapeString(p.BaseURL)
-		}
+		base := html.EscapeString(p.BaseURL)
 		pid := "prov-" + html.EscapeString(pname)
-		b.WriteString(`<div class="card prov-card` + map[bool]string{true: "", false: " prov-off"}[ok] + `">`)
+		b.WriteString(`<div class="card prov-card">`)
 		b.WriteString(`<div class="prov-head">` +
-			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"` + boolAttr(!ok) + `> <b>` + html.EscapeString(pname) + `</b></label>` +
-			`<span class="muted">` + base + `</span>` + badge +
+			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"> <b>` + html.EscapeString(pname) + `</b></label>` +
+			`<span class="muted">` + base + `</span>` +
 			`<span class="muted">` + strconv.Itoa(len(models)) + ` 个模型</span>` +
 			`<button class="btn btn-mini cp-fold" type="button" data-target="` + pid + `" title="折叠/展开">▾</button></div>`)
 		b.WriteString(`<div class="prov-body" id="` + pid + `">`)
-		b.WriteString(`<table class="mdl-table"><thead><tr><th class="ck"></th><th>模型</th><th>内部名 / 别名</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>上次状态</th><th>最近探测详情</th></tr></thead><tbody>`)
+		b.WriteString(`<table class="mdl-table"><thead><tr><th class="ck"></th><th>模型</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>上次状态</th><th>最近探测详情</th></tr></thead><tbody>`)
 		for _, me := range models {
-			b.WriteString(listRow(pname, me, rep, ok))
+			b.WriteString(listRow(pname, me, rep))
 		}
 		b.WriteString(`</tbody></table></div></div>`)
 	}
 	if !anyModel {
-		b.WriteString(`<div class="card"><p class="muted">config.yaml 中未发现 openai-compatibility 模型条目。</p></div>`)
+		b.WriteString(`<div class="card"><p class="muted">没有可探测的供应商（需启用且配置 base-url 与 api-key）。</p></div>`)
 	}
 	b.WriteString(fabStart())
 	b.WriteString(`</div>`)
@@ -1116,7 +1120,7 @@ func listHTML() []byte {
 }
 
 // listRow 渲染模型列表页的一行：优先用上次探测结果，缺失时回落 config 现值。
-func listRow(pname string, me *modelEntry, rep *probeReport, ok bool) string {
+func listRow(pname string, me *modelEntry, rep *probeReport) string {
 	ctxV, outV := "—", "—"
 	srcCtx, srcOut := "", ""
 	detail := ""
@@ -1140,17 +1144,9 @@ func listRow(pname string, me *modelEntry, rep *probeReport, ok bool) string {
 		ctxV = strconv.Itoa(me.maxclVal)
 		srcCtx = "config 现值"
 	}
-	parts := []string{}
-	if me.name != "" {
-		parts = append(parts, me.name)
-	}
-	if me.alias != "" && me.alias != me.name && me.alias != me.public {
-		parts = append(parts, "别名 "+me.alias)
-	}
-	return `<tr class="cp-row` + map[bool]string{true: "", false: " row-off"}[ok] + `"><td class="ck">` +
-		`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"` + boolAttr(!ok) + `></td>` +
+	return `<tr class="cp-row"><td class="ck">` +
+		`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"></td>` +
 		`<td>` + html.EscapeString(me.public) + `</td>` +
-		`<td class="muted">` + html.EscapeString(strings.Join(parts, " · ")) + `</td>` +
 		`<td>` + ctxV + `</td><td class="muted">` + html.EscapeString(srcCtx) + `</td>` +
 		`<td>` + outV + `</td><td class="muted">` + html.EscapeString(srcOut) + `</td>` +
 		`<td class="` + stCls + `">` + stLabel + `</td>` +
@@ -1193,13 +1189,6 @@ func fabProbe() string {
 		`<button class="btn" id="btn-retry" type="button">↻ 重试</button>` +
 		`<button class="btn" id="btn-apply" type="button">⬇ 数据回写</button>` +
 		`<button class="btn" id="btn-finish" type="button">✔ 完成</button></div>`
-}
-
-func boolAttr(off bool) string {
-	if off {
-		return " disabled"
-	}
-	return ""
 }
 
 // ------------------------- 探测引擎 -------------------------

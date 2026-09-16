@@ -1,11 +1,44 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// updateVersionRefs 由 `go test -run TestReadmeVersionInSync -update` 传入，
+// 用于把 README 顶部版本行同步为 pluginVersion。
+var updateVersionRefs = flag.Bool("update", false, "同步 README.md 的版本行到 pluginVersion")
+
+// TestReadmeVersionInSync 保证 README 顶部「当前版本：**x**」与 pluginVersion 一致：
+// 默认不一致即失败；加 -update 则自动改写 README（构建脚本会调用）。
+func TestReadmeVersionInSync(t *testing.T) {
+	const path = "README.md"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`(当前版本：\*\*)([^*]+)(\*\*)`)
+	m := re.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("%s 中未找到「当前版本：**x**」标记", path)
+	}
+	if m[2] == pluginVersion {
+		return
+	}
+	if *updateVersionRefs {
+		out := re.ReplaceAllString(string(raw), "${1}"+pluginVersion+"${3}")
+		if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("README.md 版本已同步为 %s", pluginVersion)
+		return
+	}
+	t.Fatalf("README 版本 %q 与 pluginVersion %q 不一致（运行 go test -run TestReadmeVersionInSync -update 同步）", m[2], pluginVersion)
+}
 
 func TestParseSel(t *testing.T) {
 	sel := parseSel(`[["openai-official","gpt-4o"],["deepseek","deepseek-chat"]]`)
@@ -138,14 +171,8 @@ openai-compatibility:
 	if !strings.Contains(html, "gpt-4o") || !strings.Contains(html, "gpt-4o-mini") {
 		t.Error("model missing")
 	}
-	if !strings.Contains(html, "gpt-4o-2024") {
-		t.Error("alias missing")
-	}
 	if !strings.Contains(html, "128000") {
 		t.Error("existing max-context-length missing")
-	}
-	if !strings.Contains(html, "已停用") {
-		t.Error("disabled provider badge missing")
 	}
 	if !strings.Contains(html, `id="btn-probe"`) {
 		t.Error("缺少右下角开始探测按钮")
@@ -153,20 +180,16 @@ openai-compatibility:
 	if !strings.Contains(html, "mdl-table") {
 		t.Error("缺少模型列表表格")
 	}
-	// disabled 供应商的模型 checkbox 应带 disabled 属性
-	deadIdx := strings.Index(html, `data-prov="dead-vendor"`)
-	if deadIdx < 0 {
-		t.Fatal("dead-vendor checkbox missing")
+	// 未启用/不可探测的供应商不应展示
+	if strings.Contains(html, "dead-vendor") || strings.Contains(html, "legacy-model") {
+		t.Error("未启用的供应商不应出现在模型列表页")
 	}
-	if !strings.Contains(html[deadIdx:deadIdx+120], "disabled") {
-		t.Error("disabled provider checkbox should carry disabled attr")
-	}
-	// 可探测供应商的模型 checkbox 不应 disabled
+	// 可探测供应商的 checkbox 不应 disabled
 	okIdx := strings.Index(html, `data-prov="openai-official"`)
 	if okIdx < 0 {
 		t.Fatal("openai-official checkbox missing")
 	}
-	if strings.Contains(html[okIdx:okIdx+120], "disabled") {
+	if strings.Contains(html[okIdx:okIdx+140], "disabled") {
 		t.Error("openai-official checkbox should not be disabled")
 	}
 }

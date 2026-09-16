@@ -1,6 +1,7 @@
 # context-probe
 
-> 当前版本：**0.9.0**（发布时递增，格式须为数字开头的点分版本，如 `0.2.0`；宿主据此检测插件更新）
+> 当前版本：**0.9.1**（唯一手写处为 `main.go` 的 `pluginVersion`；本行由构建脚本 / `go test -run TestReadmeVersionInSync -update` 自动同步。
+> 版本规范（宿主校验）：非空、**不以 `v` 开头**、匹配 `^[0-9][0-9A-Za-z.+-]*$`；更新检测按点分整数逐段比较，故推荐纯数字点分 `MAJOR.MINOR.PATCH`）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）：探测各 `openai-compatibility`
 渠道的真实上下文上限（输出上限仅在接口明确给出时取用），并把精确的 `max-context-length` 写回 `config.yaml`
@@ -75,7 +76,7 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 ## 功能页（Management API `/probe`）
 
 进入页面先展示**模型列表页**：
-- 按供应商分组列出 `config.yaml` 中全部模型；供应商表头可**折叠**（▾）、可**整组勾选**（勾选即选中该供应商下所有模型）；
+- 按供应商分组列出 `config.yaml` 中可探测的模型（未启用/不可探测的供应商不展示）；供应商表头可**折叠**（▾）、可**整组勾选**（勾选即选中该供应商下所有模型）；
 - 每个模型显示：上下文、输出上限、来源、上次状态、最近一次探测详情（优先用上次探测报告，缺失时回落 config 现值 / —）；
 - 工具栏：全选 / 全不选 / 已选计数 / JSON 报告；
 - 右下角**浮动「▶ 开始探测」**：对已勾选模型发起后台探测，随后跳转探测页。
@@ -103,7 +104,7 @@ go build -buildmode=c-shared -o dist/context-probe.dll .
 ## 说明
 
 - 429（并发/限流）、502/503/504（网关不可用）标记为**临时失败**（状态「未知」），可单点重试；
-- 已停用（`disabled: true`）的供应商不参与探测；
+- 已停用（`disabled: true`）或未配置 base-url/api-key 的供应商**不展示、不参与探测**；
 - **自定义请求头**：探测请求（chat/completions 与 /models 元数据）会带上供应商 `headers:` 中的静态自定义头，并发送宿主同款 `User-Agent: cli-proxy-openai-compat`；`$` 前缀的动态值（宿主从下游客户端请求复制）探测时无法还原，自动跳过；自定义头可覆盖默认 Authorization/Content-Type/UA（与宿主行为一致）；
 - **上下文自动补探**：probe1 用 `max_tokens=1500000` 触发报错。若报错只暴露了输出上限、没提上下文（部分站点先校验 `max_tokens`），插件会**自动**再发一次「超大输入 + `max_tokens=1`」的探测请求，逼出 `maximum context length is N` 之类的报错并提取上下文，**无需手动再触发**；输入按 token 估算取足够大（随机串防 BPE 压缩），遇 413/请求体过大自动缩小重试。
 - **输出上限（max_tokens）**：不再主动探测。仅当接口**明确返回**时才写回 `payload.override` 的 `max_tokens`——来源为 `/models` 元数据，或 probe1 报错文本中明确给出的合法上限；接口不报错/不给值时不写入（避免写入虚高假值）。
