@@ -69,7 +69,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -352,7 +351,7 @@ func registrationResult() []byte {
 		"schema_version": rpcSchemaVersion,
 		"metadata": map[string]any{
 			"Name":             "context-probe",
-			"Version":          "0.8.0",
+			"Version":          "0.9.0",
 			"Author":           "cloudwayne",
 			"GitHubRepository": "https://github.com/a39908646/context-probe",
 			"ConfigFields": []map[string]any{
@@ -425,7 +424,16 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 	}
 	switch op {
 	case "", "status":
-		return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
+		view := ""
+		if req.Query != nil {
+			if v, ok := req.Query["view"]; ok && len(v) > 0 {
+				view = strings.ToLower(v[0])
+			}
+		}
+		if view == "probe" {
+			return mgmtResponse(200, "text/html; charset=utf-8", probeHTML()), nil
+		}
+		return mgmtResponse(200, "text/html; charset=utf-8", listHTML()), nil
 	case "probe":
 		provider, model := "", ""
 		var sel probeSel
@@ -461,10 +469,10 @@ func handleMgmt(reqRaw []byte) ([]byte, error) {
 			}
 		}
 		if started {
-			// 无 JS 兜底：直接返回状态页（后台探测，页面自动显示运行中+进度），不再跳独立反馈页
-			return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
+			// 无 JS 兜底：直接返回探测页（后台探测，页面自动显示运行中+进度）
+			return mgmtResponse(200, "text/html; charset=utf-8", probeHTML()), nil
 		}
-		return mgmtResponse(200, "text/html; charset=utf-8", statusHTML()), nil
+		return mgmtResponse(200, "text/html; charset=utf-8", probeHTML()), nil
 	case "apply":
 		isJSON := false
 		if req.Query != nil {
@@ -542,9 +550,10 @@ window.cpApply=function(){
   document.querySelectorAll('.chip[data-filter]').forEach(function(c){
     c.classList.toggle('chip-active',f!==''&&c.dataset.filter===f);
   });
-  document.querySelectorAll('.res-table tbody tr').forEach(function(tr){
-    var td=tr.querySelector('td.st-ok,td.st-dead,td.st-unknown');
-    var s=td?(td.classList.contains('st-ok')?'ok':td.classList.contains('st-dead')?'dead':'unknown'):'';
+  document.querySelectorAll('.cp-row').forEach(function(tr){
+    var td=tr.querySelector('td.st-ok,td.st-dead,td.st-unknown,td.st-pending');
+    var s='';
+    if(td){s=td.className.replace('st-','');}
     tr.style.display=(f===''||f===s)?'':'none';
   });
 };
@@ -603,18 +612,29 @@ function swapBody(doc){
   if(window.cpApply)window.cpApply();
   if(window.cpSelApply)window.cpSelApply();
 }
+function cpPollQS(){
+  var el=document.getElementById('cp-poll');
+  return el&&el.dataset.qs?('&'+el.dataset.qs):'';
+}
 function refreshOnce(){
-  fetch('?op=status',{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
+  fetch('?op=status'+cpPollQS(),{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
     swapBody(new DOMParser().parseFromString(html,'text/html'));
   }).catch(function(){});
 }
+window.cpNav=function(view){
+  fetch('?op=status&view='+view,{cache:'no-store'}).then(function(r){return r.text()}).then(function(html){
+    swapBody(new DOMParser().parseFromString(html,'text/html'));
+    if(document.querySelector('.cp-sel'))window.cpSelInit();
+    if(document.getElementById('cp-autorefresh'))window.cpEnsurePoll();
+  }).catch(function(){location.href='?op=status&view='+view;});
+};
 var polling=false;
 function sleep(ms){return new Promise(function(res){setTimeout(res,ms)})}
 async function pollLoop(){
   for(;;){
     await sleep(3000);
     try{
-      var res=await fetch('?op=status',{cache:'no-store'});
+      var res=await fetch('?op=status'+cpPollQS(),{cache:'no-store'});
       var html=await res.text();
       var doc=new DOMParser().parseFromString(html,'text/html');
       var keep=!!doc.getElementById('cp-autorefresh');
@@ -656,23 +676,34 @@ document.addEventListener('click',function(e){
     }).catch(function(err){ab.textContent='⬇ 应用写回';window.cpToast('写回失败',[String(err)]);});
     return;
   }
-  var pb=e.target.closest('#btn-probe');
-  if(pb){
-    e.preventDefault();
+  function cpPairs(){
     var pairs=[];
     Object.keys(window.cpSel||{}).forEach(function(k){
       var i=k.indexOf('\x1f');
       if(i>0)pairs.push([k.slice(0,i),k.slice(i+1)]);
     });
-    if(!pairs.length){
-      window.cpToast('未选择模型',['请先勾选需要探测的模型，或使用「探测全部」']);
-      return;
-    }
+    return pairs;
+  }
+  function cpRunProbe(nav){
+    var pairs=cpPairs();
+    if(!pairs.length){window.cpToast('未选择模型',['请先勾选需要探测的模型']);return;}
     fetch('?op=probe&format=json&sel='+encodeURIComponent(JSON.stringify(pairs)),{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
       if(!d.ok){window.cpToast('操作失败',[d.error||'未知错误']);return;}
       window.cpToast(d.started?'已开始探测':'探测已在运行中',d.started&&d.scope?['范围：'+d.scope,'页面将自动刷新进度']:[]);
-      setTimeout(function(){refreshOnce();window.cpEnsurePoll();},800);
+      if(nav){window.cpNav(nav);}else{setTimeout(function(){refreshOnce();window.cpEnsurePoll();},600);}
     }).catch(function(err){window.cpToast('操作失败',[String(err)]);});
+  }
+  var pb=e.target.closest('#btn-probe');
+  if(pb){e.preventDefault();cpRunProbe('probe');return;}
+  var rb=e.target.closest('#btn-retry');
+  if(rb){e.preventDefault();cpRunProbe(null);return;}
+  var fb=e.target.closest('#btn-finish');
+  if(fb){e.preventDefault();window.cpNav('list');return;}
+  var fd=e.target.closest('.cp-fold');
+  if(fd){
+    e.preventDefault();
+    var tb=document.getElementById(fd.dataset.target);
+    if(tb){var hid=tb.classList.toggle('hidden');fd.textContent=hid?'▸':'▾';}
     return;
   }
   // 统一处理探测类链接（探测全部 / 重试供应商 / 重试模型）：内联反馈，不跳转页面
@@ -730,9 +761,13 @@ document.addEventListener('click',function(e){
 	if refresh > 0 {
 		// 软刷新：fetch 局部替换 body，避免整页重载闪烁
 		script += fmt.Sprintf(`<script>
+function cpPollQS2(){
+  var el=document.getElementById('cp-poll');
+  return el&&el.dataset.qs?('&'+el.dataset.qs):'';
+}
 async function poll(){
   try{
-    const res=await fetch('?op=status',{cache:'no-store'});
+    const res=await fetch('?op=status'+cpPollQS2(),{cache:'no-store'});
     const html=await res.text();
     const doc=new DOMParser().parseFromString(html,'text/html');
     document.body.replaceChildren(...doc.body.childNodes);
@@ -828,12 +863,29 @@ a.mini{font-size:12px;font-weight:400;margin-left:6px}
 .prov-off,.row-off{opacity:.45}
 .badge{display:inline-block;padding:0 8px;border-radius:10px;font-size:11px;font-weight:500}
 .badge-off{color:var(--muted);border:1px solid var(--border)}
+/* 悬浮操作按钮（右下角） */
+.fab{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:10px;align-items:stretch;z-index:100}
+.fab .btn{box-shadow:0 4px 14px rgba(0,0,0,.25)}
+/* 供应商卡片 / 模型表 */
+.prov-card{padding:12px 16px}
+.prov-head{display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:14px;font-weight:600;flex-wrap:wrap}
+.prov-label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}
+.prov-label input{margin:0;width:15px;height:15px}
+.prov-body{overflow-x:auto}
+.prov-body.hidden{display:none}
+.mdl-table{table-layout:auto}
+.mdl-table th, .mdl-table td{padding:4px 8px}
+.mdl-table td.ck, .mdl-table th.ck{width:30px;text-align:center}
+.mdl-table input[type=checkbox]{margin:0;width:14px;height:14px;vertical-align:middle}
+.st-pending{color:var(--accent)}
 </style>
 <div id="cp-toast" class="toast"><button id="cp-toast-close" class="toast-x" title="关闭">✕</button><h3 id="cp-toast-title"></h3><ul id="cp-toast-list"></ul><p id="cp-toast-empty" class="empty">没有需要写回的变更</p></div>` + bodyHTML + "</body></html>"
 	return []byte(s)
 }
 
-func statusHTML() []byte {
+// probeHTML 渲染「探测页」：顶部状态/进度/计数标签，下方仅展示参与本次探测的
+// 供应商与模型（带复选框，可整组勾选），底部悬浮「重试 / 数据回写 / 完成」。
+func probeHTML() []byte {
 	probeMu.Lock()
 	rep := last
 	run := running
@@ -841,11 +893,13 @@ func statusHTML() []byte {
 
 	var b strings.Builder
 	b.WriteString(`<div class="wrap">`)
-	b.WriteString("<h1>Context Probe · 渠道探测</h1>")
+	b.WriteString("<h1>Context Probe · 探测</h1>")
 	b.WriteString(`<div class="toolbar">` +
-		`<a class="btn btn-primary" id="btn-probe" href="?op=probe">▶ 开始探测</a>` +
-		`<a class="btn" id="btn-apply" href="?op=apply">⬇ 应用写回</a>` +
+		`<button class="btn" id="btn-sel-all" type="button">全选</button>` +
+		`<button class="btn" id="btn-sel-none" type="button">全不选</button>` +
+		`<span class="muted" id="cp-sel-info">已选 <b>0</b> 个模型</span>` +
 		`<a class="btn" href="?op=report" target="_blank">JSON 报告</a></div>`)
+	b.WriteString(infoLine())
 
 	// 状态卡片（进度/结果优先，探测中实时刷新）
 	state := `<span class="state-idle">● 空闲</span>`
@@ -881,22 +935,15 @@ func statusHTML() []byte {
 	}
 	b.WriteString("</div>")
 
-	b.WriteString(`<p class="muted">config_path=` + html.EscapeString(cfg.ConfigPath) +
-		" · providers=[" + html.EscapeString(cfg.Providers) + "]" +
-		" · auto_apply=" + strconv.FormatBool(cfg.AutoApply) +
-		" · timeout=" + strconv.Itoa(cfg.TimeoutSecs) + "s" +
-		" · delay=" + strconv.FormatFloat(cfg.DelaySecs, 'f', -1, 64) + "s</p>")
-
 	if rep == nil {
-		// 首次无报告：选择卡片展开供勾选，放最前
-		b.WriteString(selectionCardHTML(rep, run))
-		b.WriteString(`<div class="card"><p>尚未运行探测。在上方勾选模型后点击「开始探测」。</p></div>`)
-		b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。</p></div>`)
-		return renderPage("context-probe", b.String(), 0)
+		b.WriteString(`<div class="card"><p class="muted">尚无探测数据。请返回模型列表页勾选模型后点击「开始探测」。</p></div>`)
+		b.WriteString(fabProbe())
+		b.WriteString(`<span id="cp-poll" data-qs="view=probe" hidden></span></div>`)
+		return renderPage("context-probe · 探测", b.String(), 0)
 	}
 
 	// 实时统计（不依赖探测结束后的汇总字段）
-	statTotal, statOK, statDead, statUnknown := 0, 0, 0, 0
+	statTotal, statOK, statDead, statUnknown, statPending := 0, 0, 0, 0, 0
 	for _, pm := range rep.Providers {
 		for _, r := range pm {
 			statTotal++
@@ -905,6 +952,8 @@ func statusHTML() []byte {
 				statOK++
 			case "dead":
 				statDead++
+			case "pending":
+				statPending++
 			default:
 				statUnknown++
 			}
@@ -915,6 +964,7 @@ func statusHTML() []byte {
 		fmt.Sprintf(`<span class="chip chip-ok" data-filter="ok" title="点击筛选可用模型"><span class="dot-ok"></span>可用 <span class="n">%d</span></span>`, statOK) +
 		fmt.Sprintf(`<span class="chip chip-dead" data-filter="dead" title="点击筛选死渠道"><span class="dot-dead"></span>死渠道 <span class="n">%d</span></span>`, statDead) +
 		fmt.Sprintf(`<span class="chip chip-unknown" data-filter="unknown" title="点击筛选未知模型"><span class="dot-warn"></span>未知 <span class="n">%d</span></span>`, statUnknown) +
+		fmt.Sprintf(`<span class="chip" data-filter="pending" title="点击筛选待探测"><span class="n">%d</span> 待探测</span>`, statPending) +
 		"</div></div>")
 
 	if len(rep.Applied) > 0 {
@@ -938,19 +988,20 @@ func statusHTML() []byte {
 			names = append(names, n)
 		}
 		sort.Strings(names)
-		q := url.QueryEscape(pname)
-		b.WriteString("<h2>" + html.EscapeString(pname) +
-			` <a class="mini cp-probe" href="?op=probe&provider=` + q + `" data-prov="` + html.EscapeString(pname) + `" data-model="" title="只重试该供应商全部模型">↻ 重试该供应商</a></h2>`)
-		b.WriteString("<table class=\"res-table\"><thead><tr><th>模型</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>状态</th><th>详情</th></tr></thead><tbody>")
+		pid := "pbody-" + html.EscapeString(pname)
+		b.WriteString(`<div class="card prov-card">`)
+		b.WriteString(`<div class="prov-head">` +
+			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"> <b>` + html.EscapeString(pname) + `</b></label>` +
+			`<span class="muted">` + strconv.Itoa(len(names)) + ` 个模型</span>` +
+			`<button class="btn btn-mini cp-fold" type="button" data-target="` + pid + `" title="折叠/展开">▾</button></div>`)
+		b.WriteString(`<div class="prov-body" id="` + pid + `">`)
+		b.WriteString(`<table class="mdl-table"><thead><tr><th class="ck"></th><th>模型</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>状态</th><th>当前探测详情</th></tr></thead><tbody>`)
 		for _, n := range names {
 			r := models[n]
-			cls, label := "st-ok", r.Status
-			switch r.Status {
-			case "dead":
-				cls, label = "st-dead", "死渠道"
-			case "unknown":
-				cls, label = "st-unknown", "未知"
+			if r == nil {
+				continue
 			}
+			cls, label := statusLabel(r.Status)
 			ctxV, outV := "—", "—"
 			if r.Context > 0 {
 				ctxV = strconv.Itoa(r.Context)
@@ -959,20 +1010,19 @@ func statusHTML() []byte {
 				outV = strconv.Itoa(r.Output)
 			}
 			detail := strings.Join(r.Detail, "; ")
-			mq := url.QueryEscape(firstNonEmpty(r.Name, r.Public))
-			b.WriteString("<tr><td>" + html.EscapeString(r.Public) + "</td><td>" + ctxV + "</td><td>" +
-				html.EscapeString(r.SrcCtx) + "</td><td>" + outV + "</td><td>" +
-				html.EscapeString(r.SrcOut) + "</td><td class=\"" + cls + "\">" + label +
-				` <a class="mini cp-probe" href="?op=probe&provider=` + q + `&model=` + mq + `" data-prov="` + html.EscapeString(pname) + `" data-model="` + html.EscapeString(firstNonEmpty(r.Name, r.Public)) + `" title="只重试该模型">↻</a></td><td class=` + "\"wrap-cell muted\">" +
-				html.EscapeString(detail) + "</td></tr>")
+			b.WriteString(`<tr class="cp-row"><td class="ck">` +
+				`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(firstNonEmpty(r.Name, r.Public)) + `" checked></td>` +
+				`<td>` + html.EscapeString(r.Public) + `</td><td>` + ctxV + `</td><td class="muted">` +
+				html.EscapeString(r.SrcCtx) + `</td><td>` + outV + `</td><td class="muted">` +
+				html.EscapeString(r.SrcOut) + `</td><td class="` + cls + `">` + label + `</td><td class="wrap-cell muted">` +
+				html.EscapeString(detail) + `</td></tr>`)
 		}
-		b.WriteString("</tbody></table>")
+		b.WriteString(`</tbody></table></div></div>`)
 	}
 
-	// 有报告后：选择卡片折叠置于结果下方（结果优先）
-	b.WriteString(selectionCardHTML(rep, run))
-
-	b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）与 payload.override 的 max_tokens（输出上限，按请求名追加规则，last-write-wins）。已过期的死渠道可按本报告移除或等站方修复。</p>`)
+	b.WriteString(`<p class="muted">说明：探测并写回 max-context-length（模型项）；payload.override 的 max_tokens 仅在接口明确给出输出上限时追加。</p>`)
+	b.WriteString(fabProbe())
+	b.WriteString(`<span id="cp-poll" data-qs="view=probe" hidden></span>`)
 
 	refresh := 0
 	if run {
@@ -980,42 +1030,43 @@ func statusHTML() []byte {
 		b.WriteString(`<span id="cp-autorefresh" hidden></span>`)
 	}
 	b.WriteString("</div>")
-	return renderPage("context-probe", b.String(), refresh)
+	return renderPage("context-probe · 探测", b.String(), refresh)
 }
 
-// selectionCardHTML 渲染「选择要探测的模型」卡片：
-// 解析 config.yaml 现有配置，按供应商分组列出模型及现有信息（内部名/别名/现有 max-context-length/上次状态），
-// 每行 checkbox（勾选后仅探测选中模型），供应商级 checkbox 全选该供应商。
-// 有报告或探测运行时默认折叠（结果优先），首次无报告时展开供勾选。
-func selectionCardHTML(rep *probeReport, run bool) string {
+// listHTML 渲染「模型列表页」：按供应商分组列出 config.yaml 中的全部模型，
+// 供应商表头可折叠、可整组勾选；每个模型显示上下文/输出上限/来源/上次状态/最近探测详情。
+// 右下角浮动「开始探测」按钮。
+func listHTML() []byte {
+	probeMu.Lock()
+	rep := last
+	probeMu.Unlock()
+
 	var b strings.Builder
-	collapsed := rep != nil || run
-	b.WriteString(`<div class="card` + map[bool]string{true: " collapsed", false: ""}[collapsed] + `" id="cp-sel-card">`)
-	// 标题行：折叠开关 + 计数 + 探测全部（折叠时也能一键全量探测）
-	b.WriteString(`<div class="sel-head">` +
-		`<h2 style="margin:0">① 选择要探测的模型</h2>` +
-		`<button class="btn btn-mini" id="btn-sel-toggle" type="button" title="展开/折叠">` + map[bool]string{true: "▸", false: "▾"}[collapsed] + `</button>` +
+	b.WriteString(`<div class="wrap">`)
+	b.WriteString("<h1>Context Probe · 模型列表</h1>")
+	b.WriteString(`<div class="toolbar">` +
+		`<button class="btn" id="btn-sel-all" type="button">全选</button>` +
+		`<button class="btn" id="btn-sel-none" type="button">全不选</button>` +
 		`<span class="muted" id="cp-sel-info">已选 <b>0</b> 个模型</span>` +
-		`<a class="mini cp-probe" href="?op=probe" data-prov="" data-model="" title="忽略勾选，探测全部可用模型">探测全部</a></div>`)
-	b.WriteString(`<p class="muted" style="margin:2px 0 6px">勾选需要探测的模型（按供应商分组，显示配置中现有信息），点击「开始探测」后仅对选中的模型发起探测。</p>`)
+		`<a class="btn" href="?op=report" target="_blank">JSON 报告</a></div>`)
+	b.WriteString(infoLine())
 
 	configPath, err := resolveConfigPath()
 	if err != nil {
-		b.WriteString(`<p class="muted">` + html.EscapeString(err.Error()) + `</p></div>`)
-		return b.String()
+		b.WriteString(`<div class="card"><p class="muted">` + html.EscapeString(err.Error()) + `</p></div>`)
+		b.WriteString(fabStart())
+		b.WriteString(`</div>`)
+		return renderPage("context-probe · 模型列表", b.String(), 0)
 	}
 	raw, rerr := os.ReadFile(configPath)
 	if rerr != nil {
-		b.WriteString(`<p class="muted">读取 config.yaml 失败：` + html.EscapeString(rerr.Error()) + `</p></div>`)
-		return b.String()
+		b.WriteString(`<div class="card"><p class="muted">读取 config.yaml 失败：` + html.EscapeString(rerr.Error()) + `</p></div>`)
+		b.WriteString(fabStart())
+		b.WriteString(`</div>`)
+		return renderPage("context-probe · 模型列表", b.String(), 0)
 	}
 	pc := parseCoreConfig(string(raw))
-
-	b.WriteString(`<div class="sel-body">`)
-	// 工具栏：全选 / 全不选 / 已选计数
-	b.WriteString(`<div class="sel-toolbar">` +
-		`<button class="btn" id="btn-sel-all" type="button">全选</button>` +
-		`<button class="btn" id="btn-sel-none" type="button">全不选</button></div>`)
+	b.WriteString(`<p class="muted">勾选要探测的模型（供应商表头可整组勾选，▾ 可折叠），点击右下角「开始探测」。探测完成后按配置自动回写。</p>`)
 
 	probeable := func(p *providerInfo) bool {
 		return p != nil && !p.Disabled && p.BaseURL != "" && len(p.APIKeys) > 0
@@ -1029,7 +1080,6 @@ func selectionCardHTML(rep *probeReport, run bool) string {
 			continue
 		}
 		anyModel = true
-		q := url.QueryEscape(pname)
 		ok := probeable(p)
 		badge := ""
 		if !ok {
@@ -1043,58 +1093,106 @@ func selectionCardHTML(rep *probeReport, run bool) string {
 		if p != nil {
 			base = html.EscapeString(p.BaseURL)
 		}
-		b.WriteString(`<h3 class="prov-head` + map[bool]string{true: "", false: " prov-off"}[ok] + `">` +
+		pid := "prov-" + html.EscapeString(pname)
+		b.WriteString(`<div class="card prov-card` + map[bool]string{true: "", false: " prov-off"}[ok] + `">`)
+		b.WriteString(`<div class="prov-head">` +
 			`<label class="prov-label"><input type="checkbox" class="cp-prov" data-prov="` + html.EscapeString(pname) + `"` + boolAttr(!ok) + `> <b>` + html.EscapeString(pname) + `</b></label>` +
 			`<span class="muted">` + base + `</span>` + badge +
 			`<span class="muted">` + strconv.Itoa(len(models)) + ` 个模型</span>` +
-			` <a class="mini cp-probe" href="?op=probe&provider=` + q + `" data-prov="` + html.EscapeString(pname) + `" data-model="" title="只重试该供应商全部模型">↻ 重试该供应商</a></h3>`)
-		b.WriteString(`<table class="sel-table"><thead><tr><th class="ck"></th><th>模型</th><th>内部名 / 别名</th><th>现有上下文</th><th>上次状态</th></tr></thead><tbody>`)
+			`<button class="btn btn-mini cp-fold" type="button" data-target="` + pid + `" title="折叠/展开">▾</button></div>`)
+		b.WriteString(`<div class="prov-body" id="` + pid + `">`)
+		b.WriteString(`<table class="mdl-table"><thead><tr><th class="ck"></th><th>模型</th><th>内部名 / 别名</th><th>上下文</th><th>来源</th><th>输出上限</th><th>来源</th><th>上次状态</th><th>最近探测详情</th></tr></thead><tbody>`)
 		for _, me := range models {
-			// 现有信息：config 现值
-			ctxV := "—"
-			if me.maxclVal > 0 {
-				ctxV = strconv.Itoa(me.maxclVal)
-			}
-			nameAlias := ""
-			parts := []string{}
-			if me.name != "" {
-				parts = append(parts, me.name)
-			}
-			if me.alias != "" && me.alias != me.name && me.alias != me.public {
-				parts = append(parts, "别名 "+me.alias)
-			}
-			nameAlias = html.EscapeString(strings.Join(parts, " · "))
-			// 上次状态
-			stCls, stLabel := "muted", "—"
-			if rep != nil {
-				if pm, okr := rep.Providers[pname]; okr {
-					if r, okr2 := pm[me.public]; okr2 && r != nil {
-						switch r.Status {
-						case "ok":
-							stCls, stLabel = "st-ok", "可用"
-						case "dead":
-							stCls, stLabel = "st-dead", "死渠道"
-						default:
-							stCls, stLabel = "st-unknown", "未知"
-						}
-					}
-				}
-			}
-			b.WriteString(`<tr class="` + map[bool]string{true: "", false: "row-off"}[ok] + `"><td class="ck">` +
-				`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"` + boolAttr(!ok) + `></td>` +
-				`<td>` + html.EscapeString(me.public) + `</td>` +
-				`<td class="muted">` + nameAlias + `</td>` +
-				`<td>` + ctxV + `</td>` +
-				`<td class="` + stCls + `">` + stLabel + `</td></tr>`)
+			b.WriteString(listRow(pname, me, rep, ok))
 		}
-		b.WriteString("</tbody></table>")
+		b.WriteString(`</tbody></table></div></div>`)
 	}
 	if !anyModel {
-		b.WriteString(`<p class="muted">config.yaml 中未发现 openai-compatibility 模型条目。</p>`)
+		b.WriteString(`<div class="card"><p class="muted">config.yaml 中未发现 openai-compatibility 模型条目。</p></div>`)
 	}
+	b.WriteString(fabStart())
 	b.WriteString(`</div>`)
-	b.WriteString("</div>")
-	return b.String()
+	return renderPage("context-probe · 模型列表", b.String(), 0)
+}
+
+// listRow 渲染模型列表页的一行：优先用上次探测结果，缺失时回落 config 现值。
+func listRow(pname string, me *modelEntry, rep *probeReport, ok bool) string {
+	ctxV, outV := "—", "—"
+	srcCtx, srcOut := "", ""
+	detail := ""
+	stCls, stLabel := "muted", "—"
+	if rep != nil {
+		if pm, okr := rep.Providers[pname]; okr {
+			if r, ok2 := pm[me.public]; ok2 && r != nil {
+				if r.Context > 0 {
+					ctxV = strconv.Itoa(r.Context)
+				}
+				if r.Output > 0 {
+					outV = strconv.Itoa(r.Output)
+				}
+				srcCtx, srcOut = r.SrcCtx, r.SrcOut
+				detail = strings.Join(r.Detail, "; ")
+				stCls, stLabel = statusLabel(r.Status)
+			}
+		}
+	}
+	if ctxV == "—" && me.maxclVal > 0 {
+		ctxV = strconv.Itoa(me.maxclVal)
+		srcCtx = "config 现值"
+	}
+	parts := []string{}
+	if me.name != "" {
+		parts = append(parts, me.name)
+	}
+	if me.alias != "" && me.alias != me.name && me.alias != me.public {
+		parts = append(parts, "别名 "+me.alias)
+	}
+	return `<tr class="cp-row` + map[bool]string{true: "", false: " row-off"}[ok] + `"><td class="ck">` +
+		`<input type="checkbox" class="cp-sel" data-prov="` + html.EscapeString(pname) + `" data-name="` + html.EscapeString(me.name) + `"` + boolAttr(!ok) + `></td>` +
+		`<td>` + html.EscapeString(me.public) + `</td>` +
+		`<td class="muted">` + html.EscapeString(strings.Join(parts, " · ")) + `</td>` +
+		`<td>` + ctxV + `</td><td class="muted">` + html.EscapeString(srcCtx) + `</td>` +
+		`<td>` + outV + `</td><td class="muted">` + html.EscapeString(srcOut) + `</td>` +
+		`<td class="` + stCls + `">` + stLabel + `</td>` +
+		`<td class="wrap-cell muted">` + html.EscapeString(detail) + `</td></tr>`
+}
+
+// statusLabel 把状态码转为展示样式与文案。
+func statusLabel(s string) (string, string) {
+	switch s {
+	case "ok":
+		return "st-ok", "可用"
+	case "dead":
+		return "st-dead", "死渠道"
+	case "pending":
+		return "st-pending", "待探测"
+	case "unknown":
+		return "st-unknown", "未知"
+	default:
+		return "muted", "—"
+	}
+}
+
+// infoLine 渲染配置摘要行。
+func infoLine() string {
+	return `<p class="muted">config_path=` + html.EscapeString(cfg.ConfigPath) +
+		" · providers=[" + html.EscapeString(cfg.Providers) + "]" +
+		" · auto_apply=" + strconv.FormatBool(cfg.AutoApply) +
+		" · timeout=" + strconv.Itoa(cfg.TimeoutSecs) + "s" +
+		" · delay=" + strconv.FormatFloat(cfg.DelaySecs, 'f', -1, 64) + "s</p>"
+}
+
+// fabStart 悬浮「开始探测」按钮（模型列表页）。
+func fabStart() string {
+	return `<div class="fab"><button class="btn btn-primary" id="btn-probe" type="button">▶ 开始探测</button></div>`
+}
+
+// fabProbe 悬浮操作按钮（探测页）：重试 / 数据回写 / 完成。
+func fabProbe() string {
+	return `<div class="fab">` +
+		`<button class="btn" id="btn-retry" type="button">↻ 重试</button>` +
+		`<button class="btn" id="btn-apply" type="button">⬇ 数据回写</button>` +
+		`<button class="btn" id="btn-finish" type="button">✔ 完成</button></div>`
 }
 
 func boolAttr(off bool) string {
@@ -1182,19 +1280,28 @@ func runProbe(onlyProvider, onlyModel string, sel probeSel) {
 				return true
 			}
 
-			// 计划探测总数（同样应用过滤条件）
+			// 计划探测总数（同样应用过滤条件）；预填 pending 占位，探测页即可完整展示参与列表
 			planned := 0
+			probeMu.Lock()
 			for _, pname := range pc.order {
 				if !matchProvider(pname, pc.providers[pname]) {
 					continue
 				}
 				for _, me := range pc.modelsOf(pname) {
-					if matchModel(me) {
-						planned++
+					if !matchModel(me) {
+						continue
+					}
+					planned++
+					pm := rep.Providers[pname]
+					if pm == nil {
+						pm = map[string]*modelResult{}
+						rep.Providers[pname] = pm
+					}
+					if pm[me.public] == nil {
+						pm[me.public] = &modelResult{Provider: pname, Name: me.name, Public: me.public, Status: "pending"}
 					}
 				}
 			}
-			probeMu.Lock()
 			rep.Models = planned
 			rep.Probed = 0
 			probeMu.Unlock()

@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -101,7 +100,7 @@ openai-compatibility:
 	}
 }
 
-func TestSelectionCardHTML(t *testing.T) {
+func TestListHTML(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(`
 openai-compatibility:
@@ -127,8 +126,12 @@ openai-compatibility:
 	prev := cfg.ConfigPath
 	cfg.ConfigPath = cfgPath
 	defer func() { cfg.ConfigPath = prev }()
+	probeMu.Lock()
+	last = nil
+	running = false
+	probeMu.Unlock()
 
-	html := selectionCardHTML(nil, false)
+	html := string(listHTML())
 	if !strings.Contains(html, "openai-official") {
 		t.Error("provider name missing")
 	}
@@ -143,6 +146,12 @@ openai-compatibility:
 	}
 	if !strings.Contains(html, "已停用") {
 		t.Error("disabled provider badge missing")
+	}
+	if !strings.Contains(html, `id="btn-probe"`) {
+		t.Error("缺少右下角开始探测按钮")
+	}
+	if !strings.Contains(html, "mdl-table") {
+		t.Error("缺少模型列表表格")
 	}
 	// disabled 供应商的模型 checkbox 应带 disabled 属性
 	deadIdx := strings.Index(html, `data-prov="dead-vendor"`)
@@ -215,12 +224,6 @@ func mustRead(p string) string {
 	return string(b)
 }
 
-// 布局：有报告时选择卡折叠且位于结果表之后（结果优先）；无报告时展开在顶部
-func selCardClass(html string) string {
-	re := regexp.MustCompile(`<div class="card[^"]*" id="cp-sel-card"`)
-	return re.FindString(html)
-}
-
 func writeMiniCfg(t *testing.T) string {
 	t.Helper()
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -238,13 +241,13 @@ openai-compatibility:
 	return cfgPath
 }
 
-func TestLayoutWithReport(t *testing.T) {
+func TestProbeHTMLWithReport(t *testing.T) {
 	cfg.ConfigPath = writeMiniCfg(t)
 	rep := &probeReport{
 		ProbedAt: "2026-01-01 00:00:00",
 		Models:   1, Probed: 1, Total: 1, OK: 1,
 		Providers: map[string]map[string]*modelResult{
-			"v1": {"m1": {Provider: "v1", Name: "m1", Public: "m1", Context: 100, SrcCtx: "元数据", Status: "ok"}},
+			"v1": {"m1": {Provider: "v1", Name: "m1", Public: "m1", Context: 100, SrcCtx: "元数据", Status: "ok", Detail: []string{"元数据: /models 命中"}}},
 		},
 	}
 	probeMu.Lock()
@@ -252,37 +255,39 @@ func TestLayoutWithReport(t *testing.T) {
 	running = false
 	probeMu.Unlock()
 
-	html := string(statusHTML())
-	cardIdx := strings.Index(html, `id="cp-sel-card"`)
-	resIdx := strings.Index(html, "res-table")
-	if cardIdx < 0 || resIdx < 0 {
-		t.Fatalf("card=%d res=%d", cardIdx, resIdx)
+	html := string(probeHTML())
+	if !strings.Contains(html, "mdl-table") {
+		t.Error("缺少参与模型表格")
 	}
-	if cardIdx < resIdx {
-		t.Error("选择卡片应在结果表之后（结果优先）")
+	if !strings.Contains(html, `class="cp-row"`) {
+		t.Error("缺少模型行 cp-row")
 	}
-	if !strings.Contains(selCardClass(html), "collapsed") {
-		t.Error("有报告时选择卡应默认折叠")
+	if !strings.Contains(html, `id="btn-retry"`) || !strings.Contains(html, `id="btn-apply"`) || !strings.Contains(html, `id="btn-finish"`) {
+		t.Error("缺少悬浮 重试/数据回写/完成 按钮")
 	}
-	if !strings.Contains(html, "btn-sel-toggle") {
-		t.Error("缺少折叠开关")
+	if !strings.Contains(html, `id="cp-poll"`) || !strings.Contains(html, `data-qs="view=probe"`) {
+		t.Error("缺少探测页轮询标记")
 	}
-	if !strings.Contains(html, `class="mini cp-probe"`) {
-		t.Error("重试链接应带 cp-probe class（JS 内联反馈，不跳页）")
+	if !strings.Contains(html, "元数据: /models 命中") {
+		t.Error("缺少探测详情")
+	}
+	if !strings.Contains(html, "stat-chips") {
+		t.Error("缺少状态计数标签")
 	}
 }
 
-func TestLayoutNoReport(t *testing.T) {
+func TestProbeHTMLNoReport(t *testing.T) {
 	cfg.ConfigPath = writeMiniCfg(t)
 	probeMu.Lock()
 	last = nil
 	running = false
 	probeMu.Unlock()
 
-	html := string(statusHTML())
-	if cls := selCardClass(html); cls == "" {
-		t.Fatal("无报告时应有选择卡")
-	} else if strings.Contains(cls, "collapsed") {
-		t.Errorf("无报告时选择卡应展开, got %q", cls)
+	html := string(probeHTML())
+	if !strings.Contains(html, "尚无探测数据") {
+		t.Error("无报告时应提示尚无探测数据")
+	}
+	if !strings.Contains(html, `id="cp-poll"`) {
+		t.Error("缺少探测页轮询标记")
 	}
 }
