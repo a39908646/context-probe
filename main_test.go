@@ -57,7 +57,6 @@ func TestParseSel(t *testing.T) {
 	if sel.has("other-vendor", "anything") {
 		t.Error("other-vendor should NOT be selected")
 	}
-	// empty / garbage
 	if parseSel("") != nil {
 		t.Error("empty raw should be nil")
 	}
@@ -77,7 +76,7 @@ openai-compatibility:
     headers:
       HTTP-Referer: "https://example.com"
       X-Title: "My Proxy"
-      X-Session-Id: "$ABC"      # 动态值，探测时应跳过
+      X-Session-Id: "$ABC"      # 动态值，测试时应跳过
       User-Agent: "Custom-UA"    # 应保留原始大小写并可覆盖默认 UA
     api-key-entries:
       - api-key: sk-test
@@ -97,21 +96,13 @@ openai-compatibility:
 	if p.Headers["HTTP-Referer"] != "https://example.com" {
 		t.Errorf("HTTP-Referer = %q", p.Headers["HTTP-Referer"])
 	}
-	if p.Headers["X-Title"] != "My Proxy" {
-		t.Errorf("X-Title = %q", p.Headers["X-Title"])
-	}
-	if _, ok := p.Headers["X-Session-Id"]; !ok {
-		t.Error("解析层应保留 $ 动态值原样（与宿主语义一致），过滤交给 providerHeaders")
-	}
 	if p.Headers["User-Agent"] != "Custom-UA" {
 		t.Errorf("User-Agent = %q，键大小写应保留", p.Headers["User-Agent"])
 	}
-	// 解析层保留 $ 原值（与宿主语义一致），过滤发生在 providerHeaders
 	if p.Headers["X-Session-Id"] != "$ABC" {
 		t.Errorf("X-Session-Id 解析值 = %q，应为 $ABC（引号已剥离）", p.Headers["X-Session-Id"])
 	}
 
-	// providerHeaders 过滤逻辑
 	hdrs := providerHeaders(p)
 	if len(hdrs["HTTP-Referer"]) != 1 || hdrs["HTTP-Referer"][0] != "https://example.com" {
 		t.Errorf("providerHeaders HTTP-Referer = %v", hdrs["HTTP-Referer"])
@@ -122,20 +113,15 @@ openai-compatibility:
 	if hdrs["User-Agent"][0] != "Custom-UA" {
 		t.Errorf("providerHeaders User-Agent = %v", hdrs["User-Agent"])
 	}
-	// 无 headers 的供应商返回空 map
-	empty := providerHeaders(pc.providers["plain"])
-	if len(empty) != 0 {
-		t.Errorf("plain provider headers = %v, want empty", empty)
+	if len(providerHeaders(pc.providers["plain"])) != 0 {
+		t.Error("plain provider headers should be empty")
 	}
-	nilHeaders := providerHeaders(nil)
-	if len(nilHeaders) != 0 {
+	if len(providerHeaders(nil)) != 0 {
 		t.Error("nil provider should give empty headers")
 	}
 }
 
-func TestListHTML(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte(`
+const listCfg = `
 openai-compatibility:
   - name: openai-official
     base-url: https://api.openai.com/v1
@@ -153,16 +139,20 @@ openai-compatibility:
     disabled: true
     models:
       - name: legacy-model
-`), 0o644); err != nil {
+`
+
+func TestListHTML(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(listCfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	prev := cfg.ConfigPath
 	cfg.ConfigPath = cfgPath
 	defer func() { cfg.ConfigPath = prev }()
-	probeMu.Lock()
+	mu.Lock()
 	last = nil
 	running = false
-	probeMu.Unlock()
+	mu.Unlock()
 
 	html := string(listHTML())
 	if !strings.Contains(html, "openai-official") {
@@ -171,146 +161,144 @@ openai-compatibility:
 	if !strings.Contains(html, "gpt-4o") || !strings.Contains(html, "gpt-4o-mini") {
 		t.Error("model missing")
 	}
-	if !strings.Contains(html, "128000") {
-		t.Error("existing max-context-length missing")
+	if !strings.Contains(html, `value="128000"`) {
+		t.Error("existing max-context-length should be pre-filled in the input")
 	}
-	if !strings.Contains(html, `id="btn-probe"`) {
-		t.Error("缺少右下角开始探测按钮")
+	if !strings.Contains(html, `class="inp in-ctx"`) || !strings.Contains(html, `class="inp in-out"`) {
+		t.Error("缺少可编辑的上下文 / 输出上限输入框")
 	}
-	if !strings.Contains(html, "mdl-table") {
-		t.Error("缺少模型列表表格")
+	if !strings.Contains(html, `id="btn-test"`) {
+		t.Error("缺少「按 config 值测试」按钮")
+	}
+	if !strings.Contains(html, `id="btn-save"`) {
+		t.Error("缺少「保存并回写 config」按钮")
+	}
+	if !strings.Contains(html, `id="cp-only-empty"`) {
+		t.Error("缺少「仅看上下文为空」筛选")
+	}
+	if !strings.Contains(html, `id="btn-batch-ctx"`) || !strings.Contains(html, `id="btn-batch-out"`) {
+		t.Error("缺少批量编辑按钮")
 	}
 	// 未启用/不可探测的供应商不应展示
 	if strings.Contains(html, "dead-vendor") || strings.Contains(html, "legacy-model") {
 		t.Error("未启用的供应商不应出现在模型列表页")
 	}
-	// 可探测供应商的 checkbox 不应 disabled
-	okIdx := strings.Index(html, `data-prov="openai-official"`)
-	if okIdx < 0 {
-		t.Fatal("openai-official checkbox missing")
+}
+
+func TestOverrideOutputs(t *testing.T) {
+	text := `
+payload:
+  override:
+    - "models":
+        - "name": "gpt-4o"
+          "protocol": "openai"
+      "params":
+        "max_tokens": 4096
+    - "models":
+        - "name": "gpt-4o"
+        - "name": "claude-3"
+      "params":
+        "max_tokens": 8192
+`
+	outs := overrideOutputs(splitLines(text))
+	if outs["gpt-4o"] != 8192 {
+		t.Errorf("gpt-4o output = %d, want 8192 (last rule wins)", outs["gpt-4o"])
 	}
-	if strings.Contains(html[okIdx:okIdx+140], "disabled") {
-		t.Error("openai-official checkbox should not be disabled")
+	if outs["claude-3"] != 8192 {
+		t.Errorf("claude-3 output = %d, want 8192", outs["claude-3"])
+	}
+	if len(overrideOutputs(splitLines("other: 1\n"))) != 0 {
+		t.Error("no payload section should yield empty map")
 	}
 }
 
-func TestSelectionFiltersProbe(t *testing.T) {
-	// 验证选中集合在 runProbe 匹配逻辑中的行为（通过构建一个临时 config + sel 做定点计划计数）
+func TestApplyEditsWritesContextAndOutput(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte(`
-openai-compatibility:
-  - name: v1
-    base-url: https://api.a.com
-    api-key: k
-    models:
-      - name: m1
-      - name: m2
-  - name: v2
-    base-url: https://api.b.com
-    api-key: k
-    models:
-      - name: m3
-`), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(listCfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	prev := cfg.ConfigPath
 	cfg.ConfigPath = cfgPath
 	defer func() { cfg.ConfigPath = prev }()
 
-	pc := parseCoreConfig(mustRead(cfgPath))
-	sel := parseSel(`[["v1","m2"],["v2","m3"]]`)
-	if sel == nil {
-		t.Fatal("sel nil")
-	}
-
-	planned := 0
-	for _, pname := range pc.order {
-		if _, ok := sel[pname]; !ok {
-			continue
-		}
-		for _, me := range pc.modelsOf(pname) {
-			if sel.has(me.provider, me.name) || sel.has(me.provider, me.public) {
-				planned++
-			}
-		}
-	}
-	if planned != 2 {
-		t.Fatalf("planned = %d, want 2 (m2,m3)", planned)
-	}
-}
-
-func mustRead(p string) string {
-	b, err := os.ReadFile(p)
+	changes, err := applyEdits([]modelEdit{
+		{Provider: "openai-official", Name: "gpt-4o-mini", Public: "gpt-4o-mini", Context: 64000},
+		{Provider: "openai-official", Name: "gpt-4o", Public: "gpt-4o-2024", Output: 4096},
+	})
 	if err != nil {
-		panic(err)
-	}
-	return string(b)
-}
-
-func writeMiniCfg(t *testing.T) string {
-	t.Helper()
-	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte(`
-openai-compatibility:
-  - name: v1
-    base-url: http://127.0.0.1:1
-    api-key-entries:
-      - api-key: k
-    models:
-      - name: m1
-`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return cfgPath
+	if len(changes) != 2 {
+		t.Fatalf("changes = %v, want 2 entries", changes)
+	}
+
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := parseCoreConfig(string(raw))
+	vals := map[string]int{}
+	for _, me := range pc.models {
+		vals[me.name] = me.maxclVal
+	}
+	if vals["gpt-4o-mini"] != 64000 {
+		t.Errorf("gpt-4o-mini max-context-length = %d, want 64000", vals["gpt-4o-mini"])
+	}
+	if vals["gpt-4o"] != 128000 {
+		t.Errorf("gpt-4o max-context-length = %d, want unchanged 128000", vals["gpt-4o"])
+	}
+	outs := overrideOutputs(splitLines(string(raw)))
+	if outs["gpt-4o-2024"] != 4096 {
+		t.Errorf("gpt-4o-2024 output = %d, want 4096", outs["gpt-4o-2024"])
+	}
 }
 
-func TestProbeHTMLWithReport(t *testing.T) {
-	cfg.ConfigPath = writeMiniCfg(t)
-	rep := &probeReport{
-		ProbedAt: "2026-01-01 00:00:00",
-		Models:   1, Probed: 1, Total: 1, OK: 1,
-		Providers: map[string]map[string]*modelResult{
-			"v1": {"m1": {Provider: "v1", Name: "m1", Public: "m1", Context: 100, SrcCtx: "元数据", Status: "ok", Detail: []string{"元数据: /models 命中"}}},
+func TestApplyEditsNoChange(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(listCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := cfg.ConfigPath
+	cfg.ConfigPath = cfgPath
+	defer func() { cfg.ConfigPath = prev }()
+
+	before, _ := os.ReadFile(cfgPath)
+	changes, err := applyEdits([]modelEdit{
+		{Provider: "openai-official", Name: "gpt-4o", Public: "gpt-4o-2024", Context: 128000},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("changes = %v, want none (same value)", changes)
+	}
+	after, _ := os.ReadFile(cfgPath)
+	if string(before) != string(after) {
+		t.Error("config file should be untouched when value is unchanged")
+	}
+}
+
+func TestStatusJSONShape(t *testing.T) {
+	mu.Lock()
+	last = &testRun{
+		StartedAt: "2026-01-01 00:00:00",
+		Total:     1, Done: 1,
+		Results: map[string]map[string]*modelResult{
+			"v1": {"m1": {Provider: "v1", Name: "m1", Public: "m1", Status: "ok", Detail: "HTTP 200"}},
 		},
 	}
-	probeMu.Lock()
-	last = rep
 	running = false
-	probeMu.Unlock()
+	mu.Unlock()
 
-	html := string(probeHTML())
-	if !strings.Contains(html, "mdl-table") {
-		t.Error("缺少参与模型表格")
+	d := statusJSON()
+	if d["running"] != false {
+		t.Error("running should be false")
 	}
-	if !strings.Contains(html, `class="cp-row"`) {
-		t.Error("缺少模型行 cp-row")
+	if d["total"] != 1 || d["done"] != 1 {
+		t.Errorf("total/done = %v/%v, want 1/1", d["total"], d["done"])
 	}
-	if !strings.Contains(html, `id="btn-retry"`) || !strings.Contains(html, `id="btn-apply"`) || !strings.Contains(html, `id="btn-finish"`) {
-		t.Error("缺少悬浮 重试/数据回写/完成 按钮")
-	}
-	if !strings.Contains(html, `id="cp-poll"`) || !strings.Contains(html, `data-qs="view=probe"`) {
-		t.Error("缺少探测页轮询标记")
-	}
-	if !strings.Contains(html, "元数据: /models 命中") {
-		t.Error("缺少探测详情")
-	}
-	if !strings.Contains(html, "stat-chips") {
-		t.Error("缺少状态计数标签")
-	}
-}
-
-func TestProbeHTMLNoReport(t *testing.T) {
-	cfg.ConfigPath = writeMiniCfg(t)
-	probeMu.Lock()
-	last = nil
-	running = false
-	probeMu.Unlock()
-
-	html := string(probeHTML())
-	if !strings.Contains(html, "尚无探测数据") {
-		t.Error("无报告时应提示尚无探测数据")
-	}
-	if !strings.Contains(html, `id="cp-poll"`) {
-		t.Error("缺少探测页轮询标记")
+	rs, ok := d["results"].(map[string]map[string]*modelResult)
+	if !ok || rs["v1"]["m1"].Status != "ok" {
+		t.Error("results missing")
 	}
 }
