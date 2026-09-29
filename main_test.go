@@ -121,25 +121,85 @@ openai-compatibility:
 	}
 }
 
+// listCfg 采用新内核格式：openai-compatibility 嵌套于 api-keys 段下，
+// quoted 键、"keys": 块、供应商 name 后置（models 之后）。
 const listCfg = `
-openai-compatibility:
-  - name: openai-official
-    base-url: https://api.openai.com/v1
-    api-key-entries:
-      - api-key: sk-test1
-    models:
-      - name: gpt-4o
-        alias: gpt-4o-2024
-        max-context-length: 128000
-      - name: gpt-4o-mini
-  - name: dead-vendor
-    base-url: https://api.example.com
-    api-key-entries:
-      - api-key: sk-test2
-    disabled: true
-    models:
-      - name: legacy-model
+api-keys:
+    openai-compatibility:
+        - "base-url": https://api.openai.com/v1
+          "keys":
+            - "api-key": sk-test1
+          "models":
+            - "name": gpt-4o
+              "alias": gpt-4o-2024
+              "max-context-length": 128000
+            - "name": gpt-4o-mini
+          "name": openai-official
+          "prefix": openai-official
+        - "base-url": https://api.example.com
+          "keys":
+            - "api-key": sk-test2
+          "disabled": true
+          "models":
+            - "name": legacy-model
+          "name": dead-vendor
 `
+
+// newKernelCfg 覆盖真实新格式的边角：thinking 子块、max-context-length 在 name 之前、thinking.levels 更深缩进。
+const newKernelCfg = `
+api-keys:
+    codex: []
+    openai-compatibility:
+        - "base-url": "https://x.example/v1"
+          "keys":
+            - "api-key": sk-x
+          "models":
+            - "name": deepseek-v4.1-flash
+              "thinking":
+                "levels":
+                    - "high"
+            - "max-context-length": 1000000
+              "name": deepseek-v4-flash
+              "thinking":
+                "levels":
+                    - "high"
+            - "name": plain-model
+          "name": 听风
+          "prefix": "听风"
+`
+
+func TestParseNewKernelFormat(t *testing.T) {
+	pc := parseCoreConfig(newKernelCfg)
+	p := pc.providers["听风"]
+	if p == nil {
+		t.Fatal("provider 听风 missing")
+	}
+	if p.BaseURL != "https://x.example/v1" {
+		t.Errorf("base-url = %q", p.BaseURL)
+	}
+	if len(p.APIKeys) != 1 || p.APIKeys[0] != "sk-x" {
+		t.Errorf("api keys = %v", p.APIKeys)
+	}
+	if len(pc.models) != 3 {
+		t.Fatalf("models = %d, want 3", len(pc.models))
+	}
+	byName := map[string]*modelEntry{}
+	for _, m := range pc.models {
+		byName[m.name] = m
+	}
+	if m := byName["deepseek-v4.1-flash"]; m == nil || m.maxclIdx >= 0 {
+		t.Errorf("deepseek-v4.1-flash 解析错误: %+v", m)
+	}
+	if m := byName["deepseek-v4-flash"]; m == nil || m.maxclVal != 1000000 || m.maxclIdx < 0 {
+		t.Errorf("deepseek-v4-flash max-context-length 应为 1000000: %+v", m)
+	}
+	if m := byName["plain-model"]; m == nil || m.maxclIdx >= 0 {
+		t.Errorf("plain-model 解析错误: %+v", m)
+	}
+	if pc.models[0].itemIndent == 0 {
+		t.Error("itemIndent 应记录模型条目缩进")
+	}
+}
 
 func TestListHTML(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.yaml")

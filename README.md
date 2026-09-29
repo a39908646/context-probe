@@ -1,11 +1,15 @@
 # context-probe
 
-> 当前版本：**0.10.0**（唯一手写处为 `main.go` 的 `pluginVersion`；本行由构建脚本 / `go test -run TestReadmeVersionInSync -update` 自动同步。
+> 当前版本：**0.11.0**（唯一手写处为 `main.go` 的 `pluginVersion`；本行由构建脚本 / `go test -run TestReadmeVersionInSync -update` 自动同步。
 > 版本规范（宿主校验）：非空、**不以 `v` 开头**、匹配 `^[0-9][0-9A-Za-z.+-]*$`；更新检测按点分整数逐段比较，故推荐纯数字点分 `MAJOR.MINOR.PATCH`）
 
 CLIProxyAPI 标准动态库插件（Management API 能力）。把 `config.yaml` 中 `openai-compatibility`
 渠道的模型列出来，支持**手动填写上下文上限**并写回 config，并按 config 里的值**直接测试**渠道是否报错。
 
+> v0.11.0：适配内核新配置格式：`openai-compatibility` 嵌套于 `api-keys` 段下（任意缩进相对解析），
+> 兼容 `"keys":` 块、quoted 键、供应商 `name` 后置、`thinking` 子块与键序不固定的模型项；
+> `payload:` 段定位改为任意缩进（嵌套于 `requests` 下也能读写 override 规则）。
+>
 > v0.10.0 起按需求重构：删除自动探测 / 报错提取 / 元数据推断 / 超大输入补探等全部猜测逻辑，
 > 值完全由用户手动决定，插件只负责展示、编辑、写回、测试。
 

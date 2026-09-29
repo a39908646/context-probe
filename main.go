@@ -89,7 +89,7 @@ const rpcSchemaVersion uint32 = 6 // 与宿主 pluginabi.SchemaVersion 一致，
 // 宿主规范：非空、不以 v 开头、匹配 ^[0-9][0-9A-Za-z.+-]*$（见 internal/pluginstore/registry.go）；
 // 更新检测按点分整数逐段比较，故用纯数字点分（如 0.10.0）最稳。
 // README 顶部「当前版本」行由构建脚本/测试自动同步，勿手改。
-const pluginVersion = "0.10.0"
+const pluginVersion = "0.11.0"
 
 // ------------------------- ABI -------------------------
 
@@ -1196,6 +1196,7 @@ type modelEntry struct {
 	alias      string
 	public     string
 	itemIdx    int
+	itemIndent int
 	lastKeyIdx int
 	maxclIdx   int
 	maxclVal   int
@@ -1232,86 +1233,113 @@ func (pc *parsedConfig) modelsOf(provider string) []*modelEntry {
 func parseCoreConfig(text string) *parsedConfig {
 	lines := splitLines(text)
 	pc := &parsedConfig{lines: lines, providers: map[string]*providerInfo{}}
-	section := ""
-	var curProvider *providerInfo
-	inModels := false
-	inHeaders := false
-	cur := (*modelEntry)(nil)
 
+	// 定位 openai-compatibility 键：任意缩进（旧内核顶层段，新内核嵌套于 api-keys 段下）
+	compatIdx, compatIndent := -1, -1
 	for i, raw := range lines {
 		s := strings.TrimSpace(raw)
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
-		indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
+		kv := keyValueRe.FindStringSubmatch(s)
+		if kv == nil || !strings.EqualFold(strings.TrimSpace(unquote(kv[1])), "openai-compatibility") {
+			continue
+		}
+		val := strings.TrimSpace(unquote(kv[2]))
+		if val != "" && !strings.HasPrefix(val, "-") {
+			continue // 同名普通键，非段定义
+		}
+		compatIdx, compatIndent = i, indentOf(raw)
+		break
+	}
+	if compatIdx < 0 {
+		return pc
+	}
 
-		if indent == 0 {
-			m := sectionRe.FindStringSubmatch(raw)
-			if m != nil {
-				section = m[1]
-				if strings.HasPrefix(strings.TrimSpace(m[2]), "[") {
-					section = ""
+	// 供应商条目块：compat 段下第一个 `- ` 行的缩进为 providerIndent（相对缩进，不写死层级）
+	pi := -1
+	var starts []int
+	for i := compatIdx + 1; i < len(lines); i++ {
+		raw := lines[i]
+		s := strings.TrimSpace(raw)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		ind := indentOf(raw)
+		if ind <= compatIndent {
+			break // 离开 compat 段
+		}
+		if !strings.HasPrefix(s, "-") {
+			continue
+		}
+		if pi < 0 {
+			pi = ind
+		}
+		if ind == pi {
+			starts = append(starts, i)
+		}
+	}
+
+	for bi, start := range starts {
+		end := len(lines)
+		if bi+1 < len(starts) {
+			end = starts[bi+1]
+		}
+		parseProviderBlock(pc, lines, start, end, pi, compatIndent)
+	}
+
+	for _, m := range pc.models {
+		m.public = firstNonEmpty(m.alias, m.name)
+	}
+	return pc
+}
+
+// parseProviderBlock 解析单个供应商条目（start..end 行，条目首行缩进 pi）。
+// 兼容新内核格式（"name" 后置、"keys": 块、quoted 键、"thinking" 子块）与旧格式。
+func parseProviderBlock(pc *parsedConfig, lines []string, start, end, pi, secIndent int) {
+	name, baseURL := "", ""
+	var apiKeys []string
+	headers := map[string]string{}
+	disabled := false
+	inHeaders := false
+	modelsIdx := -1
+
+	for i := start; i < end; i++ {
+		raw := lines[i]
+		s := strings.TrimSpace(raw)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		ind := indentOf(raw)
+		if ind <= secIndent {
+			break
+		}
+		if strings.HasPrefix(s, "- ") || s == "-" {
+			body := strings.TrimSpace(strings.TrimPrefix(s, "-"))
+			kv := keyValueRe.FindStringSubmatch(body)
+			key, val := "", ""
+			if kv != nil {
+				key, val = strings.TrimSpace(unquote(kv[1])), unquote(kv[2])
+			}
+			if ind == pi {
+				// 供应商条目首行内联键（新格式通常是 "base-url"，旧格式是 "name"）
+				if kv != nil {
+					switch strings.ToLower(key) {
+					case "name":
+						name = val
+					case "base-url":
+						baseURL = val
+					}
 				}
+				inHeaders = false
+			} else if kv != nil && strings.EqualFold(key, "api-key") && ind > pi {
+				// api-key 条目：新格式在 "keys": 块内，旧格式直接是供应商级列表项
+				apiKeys = append(apiKeys, val)
 			} else {
-				section = ""
-			}
-			curProvider = nil
-			inModels = false
-			cur = nil
-			continue
-		}
-		if section != "openai-compatibility" {
-			continue
-		}
-
-		if strings.HasPrefix(s, "- ") {
-			body := strings.TrimSpace(s[2:])
-			if body == "" {
-				continue
-			}
-			if indent <= 2 {
-				// 供应商项
-				cur = nil
-				inModels = false
 				inHeaders = false
-				if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "name") {
-					nm := unquote(kv[2])
-					if existing, ok := pc.providers[nm]; ok {
-						curProvider = existing
-					} else {
-						curProvider = &providerInfo{Name: nm}
-						pc.providers[nm] = curProvider
-						pc.order = append(pc.order, nm)
-					}
-				} else {
-					curProvider = nil
-				}
-				continue
-			}
-			if curProvider != nil && indent == 6 {
-				// 列表项（模型 / api-key）：结束 headers 块
-				inHeaders = false
-				if inModels {
-					cur = &modelEntry{provider: curProvider.Name, itemIdx: i, maxclIdx: -1}
-					if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "name") {
-						cur.name = unquote(kv[2])
-					} else {
-						// 裸标量模型行
-						cur.name = unquote(body)
-						cur.scalar = true
-					}
-					cur.public = firstNonEmpty(cur.alias, cur.name)
-					pc.models = append(pc.models, cur)
-					continue
-				}
-				if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "api-key") {
-					curProvider.APIKeys = append(curProvider.APIKeys, unquote(kv[2]))
-				}
-				continue
 			}
 			continue
 		}
-
 		// 键行
 		kv := keyValueRe.FindStringSubmatch(s)
 		if kv == nil {
@@ -1320,85 +1348,121 @@ func parseCoreConfig(text string) *parsedConfig {
 		key := strings.ToLower(unquote(kv[1]))
 		val := unquote(kv[2])
 		rawKey := unquote(kv[1])
-		if curProvider != nil && indent <= 4 {
-			// 供应商级键（可能在 models 块之后，如 prefix/headers）：重置当前模型
-			cur = nil
+		if ind == pi+2 {
 			inHeaders = false
 			switch key {
+			case "name":
+				name = val
 			case "base-url":
-				curProvider.BaseURL = val
+				baseURL = val
 			case "disabled":
-				curProvider.Disabled = strings.EqualFold(val, "true")
+				disabled = truthy(val)
+			case "api-key":
+				apiKeys = append(apiKeys, val)
 			case "models":
-				inModels = true
-			case "api-key-entries":
-				inModels = false
+				if modelsIdx < 0 {
+					modelsIdx = i
+				}
 			case "headers":
 				inHeaders = true
-				if curProvider.Headers == nil {
-					curProvider.Headers = map[string]string{}
-				}
 			}
 			continue
 		}
-		if inHeaders && curProvider != nil && cur == nil && indent >= 6 {
+		if inHeaders && ind == pi+4 {
 			// headers 块内的键值对：保留原始大小写；$ 前缀动态值原样保留，由 providerHeaders 在请求时过滤
 			if rawKey != "" {
-				if curProvider.Headers == nil {
-					curProvider.Headers = map[string]string{}
-				}
-				curProvider.Headers[rawKey] = val
+				headers[rawKey] = val
 			}
-			continue
-		}
-		if cur != nil && indent >= 8 {
-			switch key {
-			case "name":
-				cur.name = val
-				cur.public = firstNonEmpty(cur.alias, val)
-			case "alias":
-				cur.alias = val
-				cur.public = firstNonEmpty(val, cur.name)
-			case "max-context-length":
-				cur.maxclIdx = i
-				cur.maxclVal, _ = strconv.Atoi(val)
-				cur.lastKeyIdx = i
-			}
-			cur.lastKeyIdx = i
-			continue
 		}
 	}
 
-	for _, m := range pc.models {
-		m.public = firstNonEmpty(m.alias, m.name)
+	if name == "" {
+		return
 	}
+	if _, ok := pc.providers[name]; !ok {
+		pc.order = append(pc.order, name)
+	}
+	pc.providers[name] = &providerInfo{Name: name, BaseURL: baseURL, APIKeys: apiKeys, Headers: headers, Disabled: disabled}
 
-	// 二次扫描：在供应商条目范围内查找 disabled: true（容忍任意缩进/位置）
-	curP := (*providerInfo)(nil)
-	for _, raw := range lines {
+	// 模型条目：models: 块内第一个 `- ` 行的缩进为模型条目缩进；"thinking" 等更深子块跳过
+	if modelsIdx < 0 {
+		return
+	}
+	mi := -1
+	var cur *modelEntry
+	for i := modelsIdx + 1; i < end; i++ {
+		raw := lines[i]
 		s := strings.TrimSpace(raw)
 		if s == "" || strings.HasPrefix(s, "#") {
 			continue
 		}
-		indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
-		if indent <= 2 && strings.HasPrefix(s, "- ") {
-			body := strings.TrimSpace(s[2:])
-			if kv := keyValueRe.FindStringSubmatch(body); kv != nil && strings.EqualFold(kv[1], "name") {
-				curP = pc.providers[unquote(kv[2])]
+		ind := indentOf(raw)
+		if ind <= pi+2 {
+			break // 离开 models 块
+		}
+		if strings.HasPrefix(s, "- ") || s == "-" {
+			body := strings.TrimSpace(strings.TrimPrefix(s, "-"))
+			kv := keyValueRe.FindStringSubmatch(body)
+			if kv != nil && strings.EqualFold(strings.TrimSpace(unquote(kv[1])), "api-key") {
+				continue // api-key 条目（旧格式与模型同层）
+			}
+			if mi < 0 {
+				mi = ind
+			}
+			if ind == mi {
+				cur = &modelEntry{provider: name, itemIdx: i, itemIndent: ind, maxclIdx: -1}
+				if kv != nil {
+					switch strings.ToLower(strings.TrimSpace(unquote(kv[1]))) {
+					case "name":
+						cur.name = unquote(kv[2])
+					case "max-context-length": // 新格式键序不固定，max-context-length 可出现在条目首行
+						cur.maxclIdx = i
+						cur.maxclVal, _ = strconv.Atoi(unquote(kv[2]))
+					case "alias":
+						cur.alias = unquote(kv[2])
+					default:
+						// 裸标量模型行
+						cur.name = unquote(body)
+						cur.scalar = true
+					}
+				} else {
+					// 裸标量模型行
+					cur.name = unquote(body)
+					cur.scalar = true
+				}
+				pc.models = append(pc.models, cur)
 			}
 			continue
 		}
-		if curP != nil {
-			if kv := keyValueRe.FindStringSubmatch(s); kv != nil &&
-				strings.EqualFold(strings.TrimSpace(unquote(kv[1])), "disabled") {
-				switch strings.ToLower(unquote(kv[2])) {
-				case "true", "1", "yes", "y", "on":
-					curP.Disabled = true
-				}
+		if cur != nil && ind == mi+2 {
+			kv := keyValueRe.FindStringSubmatch(s)
+			if kv == nil {
+				continue
 			}
+			key := strings.ToLower(unquote(kv[1]))
+			val := unquote(kv[2])
+			switch key {
+			case "name":
+				cur.name = val
+			case "alias":
+				cur.alias = val
+			case "max-context-length":
+				cur.maxclIdx = i
+				cur.maxclVal, _ = strconv.Atoi(val)
+			}
+			cur.lastKeyIdx = i
 		}
 	}
-	return pc
+}
+
+func indentOf(raw string) int { return len(raw) - len(strings.TrimLeft(raw, " \t")) }
+
+func truthy(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "1", "yes", "y", "on":
+		return true
+	}
+	return false
 }
 
 // ------------------------- 写回 config.yaml -------------------------
@@ -1470,7 +1534,7 @@ func applyEdits(edits []modelEdit) ([]string, error) {
 				if insertAt < me.itemIdx {
 					insertAt = me.itemIdx
 				}
-				newLine := strings.Repeat(" ", indentOfItem+2) + `"max-context-length": ` + strconv.Itoa(e.Context)
+				newLine := strings.Repeat(" ", me.itemIndent+2) + `"max-context-length": ` + strconv.Itoa(e.Context)
 				lineEdits = append(lineEdits, edit{idx: insertAt + 1, op: "insert", text: newLine})
 				changes = append(changes, fmt.Sprintf("%s/%s max-context-length （缺省）→ %d",
 					me.provider, me.name, e.Context))
@@ -1536,10 +1600,14 @@ var (
 // overrideOutputs 从 payload.override 规则中读取模型名 → max_tokens 映射（后出现者覆盖前者）。
 func overrideOutputs(lines []string) map[string]int {
 	out := map[string]int{}
-	payloadIdx := -1
+	payloadIdx, payloadIndent := -1, -1
 	for i, l := range lines {
-		if l != "" && l[0] != ' ' && l[0] != '\t' && l[0] != '#' && strings.HasPrefix(l, "payload:") {
-			payloadIdx = i
+		t := strings.TrimLeft(l, " \t")
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if strings.HasPrefix(t, "payload:") && strings.TrimSpace(strings.TrimPrefix(t, "payload:")) == "" {
+			payloadIdx, payloadIndent = i, indentOf(l)
 			break
 		}
 	}
@@ -1552,18 +1620,18 @@ func overrideOutputs(lines []string) map[string]int {
 		if l == "" || l[0] == '#' {
 			continue
 		}
-		if l[0] != ' ' && l[0] != '\t' {
+		if indentOf(l) <= payloadIndent {
 			secEnd = i
 			break
 		}
 	}
-	ovIdx, ovIndent := -1, 2
+	ovIdx, ovIndent := -1, payloadIndent+2
 	for i := payloadIdx + 1; i < secEnd; i++ {
 		l := lines[i]
 		if strings.TrimSpace(l) == "" {
 			continue
 		}
-		ind := len(l) - len(strings.TrimLeft(l, " \t"))
+		ind := indentOf(l)
 		if ind == 0 {
 			break
 		}
@@ -1624,13 +1692,15 @@ func overrideWrites(lines []string, needs []outNeed) ([]edit, []string) {
 		val   int
 	}
 	rules := []ovRule{}
-	payloadIdx, ovIdx, ovIndent := -1, -1, 2
+	payloadIdx, payloadIndent, ovIdx, ovIndent := -1, -1, -1, 2
 	for i, l := range lines {
-		if l == "" || l[0] == ' ' || l[0] == '\t' || l[0] == '#' {
+		t := strings.TrimLeft(l, " \t")
+		if t == "" || strings.HasPrefix(t, "#") {
 			continue
 		}
-		if strings.HasPrefix(l, "payload:") {
-			payloadIdx = i
+		if strings.HasPrefix(t, "payload:") && strings.TrimSpace(strings.TrimPrefix(t, "payload:")) == "" {
+			payloadIdx, payloadIndent = i, indentOf(l)
+			ovIndent = payloadIndent + 2
 			break
 		}
 	}
@@ -1641,7 +1711,7 @@ func overrideWrites(lines []string, needs []outNeed) ([]edit, []string) {
 			if l == "" || l[0] == '#' {
 				continue
 			}
-			if l[0] != ' ' && l[0] != '\t' {
+			if indentOf(l) <= payloadIndent {
 				secEnd = i
 				break
 			}
@@ -1653,8 +1723,8 @@ func overrideWrites(lines []string, needs []outNeed) ([]edit, []string) {
 			if strings.TrimSpace(l) == "" {
 				continue
 			}
-			ind := len(l) - len(strings.TrimLeft(l, " \t"))
-			if ind == 0 {
+			ind := indentOf(l)
+			if ind <= payloadIndent {
 				break
 			}
 			if ovIdx < 0 && reOverrideKey.MatchString(strings.TrimLeft(l, " \t")) {
@@ -1786,7 +1856,7 @@ func overrideWrites(lines []string, needs []outNeed) ([]edit, []string) {
 
 // ------------------------- 工具 -------------------------
 
-const indentOfItem = 6
+const indentOfItem = 6 // 旧格式模型条目缩进（仅作回退参考，插入现在用 modelEntry.itemIndent）
 
 func unquote(s string) string {
 	s = strings.TrimSpace(s)
