@@ -5,7 +5,7 @@
 //  2. 支持「仅看上下文为空」筛选；
 //  3. 单点 / 批量手动填写上下文（max-context-length）与输出上限（payload.override 的 max_tokens）；
 //  4. 保存后写回 config.yaml（宿主 file watcher 自动热加载，写前自动备份）；
-//  5. 测试：直接以 config 中填写的上下文值作为 max_tokens 发一次 chat 请求，看接口报不报错。
+//  5. 测试：只发探测请求（小 content + 大 max_tokens），从服务端报错中提取真实的 max context window 与 max tokens。
 //
 // 不再做自动探测 / 报错提取 / 元数据推断，值完全由用户决定。
 //
@@ -882,7 +882,8 @@ func nowStr() string {
 	return time.Now().Format("2006-01-02 15:04:05")
 }
 
-// runTest 直接以 config 中填写的上下文值作为 max_tokens 发一次 chat 请求，记录是否被接受。
+// runTest 只发探测请求（小 content + 大 max_tokens），从服务端报错中提取
+// 真实的 max context window（max_model_len）与 max tokens 上限。结果合并记录。
 func runTest(sel probeSel) {
 	defer func() {
 		mu.Lock()
@@ -954,24 +955,44 @@ func runTest(sel probeSel) {
 		if tg.me.maxclVal <= 0 {
 			r.Status, r.Detail = "skipped", "config 未填写上下文，已跳过（请先填写并保存）"
 		} else {
-			r.MaxTokens = tg.me.maxclVal
 			baseURL := strings.TrimRight(tg.p.BaseURL, "/")
-			status, body, derr := chatProbeWithRetry(baseURL, tg.p.APIKeys[0], tg.me.name,
-				providerHeaders(tg.p), tg.me.maxclVal, timeout)
-			switch {
-			case derr != nil:
+			hdrs := providerHeaders(tg.p)
+
+			// 只发探测请求：小 content + 大 max_tokens 触发服务端报错，
+			// 从报错中提取真实的 max context window（max_model_len）与 max_tokens 上限。
+			status, body, derr := chatProbeWithRetry(baseURL, tg.p.APIKeys[0], tg.me.name, hdrs, bigProbeMaxTokens, timeout)
+			if derr != nil {
 				r.Status, r.Detail = "net", derr.Error()
-			case status >= 200 && status < 300:
+			} else if status >= 200 && status < 300 {
 				r.Status = "ok"
-				r.Detail = fmt.Sprintf("HTTP %d：max_tokens=%d 被接受", status, tg.me.maxclVal)
-			default:
+				r.Detail = fmt.Sprintf("HTTP %d：探测请求被接受，服务端未报错，无法从报错提取限制", status)
+			} else {
 				msg := errorMessage(body)
 				r.HTTP = status
-				if dead, note := classifyFailure(status, msg); dead {
-					r.Status, r.Detail = "dead", note+"："+firstN(msg, 200)
+				ctxWin, tokLimit := extractLimits(msg)
+				if ctxWin > 0 {
+					r.Context = ctxWin
+				}
+				if tokLimit > 0 {
+					r.Output = tokLimit
+				}
+				parts := []string{}
+				if ctxWin > 0 {
+					parts = append(parts, fmt.Sprintf("max context window=%d", ctxWin))
+				}
+				if tokLimit > 0 {
+					parts = append(parts, fmt.Sprintf("max tokens=%d", tokLimit))
+				}
+				if len(parts) > 0 {
+					r.Status = "ok"
+					r.Detail = fmt.Sprintf("HTTP %d：从报错提取到 %s", status, strings.Join(parts, "，"))
 				} else {
-					r.Status = "error"
-					r.Detail = fmt.Sprintf("HTTP %d：%s", status, firstN(msg, 200))
+					if dead, note := classifyFailure(status, msg); dead {
+						r.Status, r.Detail = "dead", note+"："+firstN(msg, 200)
+					} else {
+						r.Status = "error"
+						r.Detail = fmt.Sprintf("HTTP %d：报错中未包含限制信息：%s", status, firstN(msg, 200))
+					}
 				}
 			}
 		}
@@ -993,6 +1014,49 @@ func stopped() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return stopFlag
+}
+
+// probeDetail 发起一次探测后根据结果生成详情，并回写状态与 HTTP 码。
+// 返回的 detail 形如 "HTTP 200：max_tokens=N 被接受" / "HTTP 400：..." / "网络错误：..."。
+func probeDetail(status int, body []byte, err error, maxTokens int, st *string, httpCode *int) string {
+	if err != nil {
+		*st = "net"
+		return "网络错误：" + firstN(err.Error(), 200)
+	}
+	if status >= 200 && status < 300 {
+		*st = "ok"
+		return fmt.Sprintf("HTTP %d：max_tokens=%d 被接受", status, maxTokens)
+	}
+	msg := errorMessage(body)
+	*httpCode = status
+	if dead, note := classifyFailure(status, msg); dead {
+		*st = "dead"
+		return note + "：" + firstN(msg, 200)
+	}
+	*st = "error"
+	return fmt.Sprintf("HTTP %d：%s", status, firstN(msg, 200))
+}
+
+// bigProbeMaxTokens 探测请求使用的 max_tokens：远大于常见限制，用于触发服务端报错，
+// 从报错信息中提取真实的 max context window 与 max tokens 上限。
+const bigProbeMaxTokens = 100000000
+
+var (
+	reCtxWindow  = regexp.MustCompile(`max[_ ]?(model[_ ]?(len|context|total[_ ]?tokens)|context[_ ]?(window|length)|total[_ ]?tokens)\s*[=:]\s*"?([0-9,]+)"?`)
+	reTokenLimit = regexp.MustCompile(`max[_ ]?(tokens|output[_ ]?tokens|completion[_ ]?tokens)\s*[=:]\s*"?([0-9,]+)"?`)
+)
+
+// extractLimits 从服务端报错信息中提取 max context window 与 max tokens 上限。
+// 返回 (contextWindow, tokenLimit)，未提取到则为 0。
+func extractLimits(msg string) (int, int) {
+	ctx, tok := 0, 0
+	if m := reCtxWindow.FindStringSubmatch(msg); m != nil {
+		ctx, _ = strconv.Atoi(strings.ReplaceAll(m[5], ",", ""))
+	}
+	if m := reTokenLimit.FindStringSubmatch(msg); m != nil {
+		tok, _ = strconv.Atoi(strings.ReplaceAll(m[2], ",", ""))
+	}
+	return ctx, tok
 }
 
 func resolveConfigPath() (string, error) {
@@ -1071,7 +1135,7 @@ func providerHeaders(p *providerInfo) map[string][]string {
 	return out
 }
 
-// chatProbeContent 对 /chat/completions 发一次非流式请求，max_tokens 为待验证的上下文值。
+// chatProbeContent 对 /chat/completions 发一次非流式请求，max_tokens 为待验证的输出上限值。
 func chatProbeContent(baseURL, key, model string, headers map[string][]string, content string, maxTokens int, timeout time.Duration) (int, []byte, error) {
 	payload := map[string]any{
 		"model":      model,
@@ -1530,9 +1594,24 @@ func applyEdits(edits []modelEdit) ([]string, error) {
 				changes = append(changes, fmt.Sprintf("%s/%s max-context-length %d → %d",
 					me.provider, me.name, me.maxclVal, e.Context))
 			} else {
+				// 插入点：模型最后一个键之后，但必须跳过该键下面的嵌套块
+				//（如 "thinking": 后面缩进更深的 "levels": 列表），否则会把嵌套块
+				// 从父节点拆开，产生非法 YAML（nested mapping in compact mapping）。
 				insertAt := me.lastKeyIdx
 				if insertAt < me.itemIdx {
 					insertAt = me.itemIdx
+				}
+				for j := insertAt + 1; j < len(pc.lines); j++ {
+					next := pc.lines[j]
+					ns := strings.TrimSpace(next)
+					if ns == "" || strings.HasPrefix(ns, "#") {
+						continue // 空行/注释不影响块归属
+					}
+					if indentOf(next) > me.itemIndent+2 {
+						insertAt = j // 仍是 lastKey 的嵌套内容，继续下移
+						continue
+					}
+					break // 回到同级或上一级，停止
 				}
 				newLine := strings.Repeat(" ", me.itemIndent+2) + `"max-context-length": ` + strconv.Itoa(e.Context)
 				lineEdits = append(lineEdits, edit{idx: insertAt + 1, op: "insert", text: newLine})
